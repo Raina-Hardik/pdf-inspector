@@ -10906,3 +10906,62 @@ fn test_page_geometry_mem_image_placeholder_never_enters_heuristic_cells() {
         }
     }
 }
+
+#[test]
+fn test_page_geometry_mem_real_document_shading_bands_are_not_merges() {
+    // Corpus-backed counterpart to the synthetic occupancy tests: a real
+    // document, read through the same entry point an FFI consumer uses.
+    //
+    // The defect this pins is a decorative band painted behind a row being
+    // recorded as merge evidence, so every cell of that row reports
+    // `is_own = false` pointing at ONE covering rect although the cells hold
+    // genuinely different text — a consumer filling down from that rect
+    // would discard text that was really there.
+    //
+    // Remove the merge-evidence gate and this fixture reports one such row;
+    // the 430-page `bits_pilani_feedback.pdf` reports 225 (kept out of the
+    // suite only because it takes two minutes to read). It must produce none.
+    let pdf =
+        std::fs::read("tests/fixtures/td9264.pdf").expect("corpus fixture should be readable");
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+
+    let mut checked_rows = 0usize;
+    for page in &pages {
+        for table in &page.tables {
+            let Some(occ) = table.cell_occupancy.as_ref() else {
+                continue;
+            };
+            for (r, row) in occ.iter().enumerate() {
+                if row.is_empty() || !row.iter().all(|c| !c.is_own) {
+                    continue;
+                }
+                checked_rows += 1;
+                let distinct: std::collections::HashSet<&str> = table.cells[r]
+                    .iter()
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                let first = row[0].rect;
+                let one_band = first.is_some_and(|f| {
+                    row.iter().all(|c| {
+                        c.rect.is_some_and(|x| {
+                            (x.x, x.y, x.width, x.height) == (f.x, f.y, f.width, f.height)
+                        })
+                    })
+                });
+                assert!(
+                    !(one_band && distinct.len() > 1),
+                    "page {} row {r}: cells {:?} all report the single covering rect {:?} \
+                     although they hold different text — a decorative band read as a merge",
+                    page.page,
+                    table.cells[r],
+                    first
+                );
+            }
+        }
+    }
+    assert!(
+        checked_rows > 0,
+        "fixture must exercise fully-covered rows, else the assertion never ran"
+    );
+}

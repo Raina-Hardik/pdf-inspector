@@ -1954,7 +1954,6 @@ fn rect_span_counts(
 /// The asymmetry is chosen on purpose: misreading decoration as a merge
 /// DESTROYS text, while failing to fold a genuine merge merely leaves text
 /// where it already was.
-#[allow(dead_code)] // consumed by the fold path in the detector-threshold work
 fn decorative_fill_rects(
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
