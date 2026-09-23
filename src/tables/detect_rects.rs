@@ -604,6 +604,23 @@ pub fn detect_tables_from_rects(
         // fall under the gate, and dropping the frame collapses cluster
         // adjacency between adjacent column-cell groups.
         //
+        // KNOWN DEFECT, NOT FIXED — this step destroys the evidence every
+        // decoration predicate downstream depends on. A shading band only two
+        // or three cell-heights tall passes the `bh < ah * 4.0` gate, so the
+        // table's real per-cell rects inside it are dropped here; the grid
+        // builder then never sees the row and column edges within the band
+        // and the banded rows collapse into one, before anything can judge
+        // whether the band was decoration at all.
+        //
+        // Two narrowings of the obvious fix — "a container holding children
+        // that are subdivided keeps them" — were measured and both changed
+        // real corpus output. Requiring children disjoint in either axis
+        // resurrects spurious grids over running prose
+        // (`td9264_insurance_prose_not_rect_table`). Requiring a genuine grid
+        // of children (a stacked pair AND a side-by-side pair) still shifts
+        // cell contents across `bits_pilani_feedback.pdf`. The ignored tests
+        // in `tests/integration_tests.rs` carry the reproduction.
+        //
         // Skip this O(n²) dedup when there are too many rects — pages with
         // thousands of vector-drawing rects won't benefit from cell dedup.
         if page_rects.len() < MAX_CLUSTER_RECTS {
@@ -1573,10 +1590,13 @@ fn try_build_grid(
     // `Some(rect)` means a detected `re` rect bigger than one grid slot — and
     // not classified as table decoration — is known to cover this position.
     //
-    // Deliberately computed OUTSIDE the `num_cols <= 10` guard below. That
-    // guard is about rewriting cell TEXT; coverage is only ever read back as
-    // reporting, so gating it on column count would leave wide tables
-    // claiming `is_own = true` with no evidence behind the claim.
+    // Coverage is only ever read back as reporting, never used to rewrite
+    // cell TEXT, so it is computed for every table regardless of shape. An
+    // earlier version gated text consolidation on a `num_cols <= 10` guard
+    // and deliberately kept coverage outside it; that guard is gone (see
+    // below) and coverage stays unconditional for the reason it always was —
+    // a wide table must not claim `is_own = true` with no evidence behind
+    // the claim.
     let mut merge_coverage: Vec<Vec<Option<CellRect>>> = vec![vec![None; num_cols]; num_rows];
     let evidence_excluded =
         non_merge_evidence_rects(group_rects, skip_rects, &col_edges, &row_edges, &cells);
@@ -1604,7 +1624,8 @@ fn try_build_grid(
     // guard was gesturing at. It is the multi-row half of the same
     // decoration concept `non_merge_evidence_rects` above is built on, not
     // a second predicate.
-    let merge_excluded = decorative_fill_rects(group_rects, skip_rects, &col_edges, &row_edges);
+    let merge_excluded =
+        decorative_fill_rects(group_rects, skip_rects, &col_edges, &row_edges, &cells);
     propagate_merged_cells(
         &mut cells,
         &col_edges,
@@ -1966,22 +1987,59 @@ fn rect_span_counts(
 ///
 /// A rect is decoration when all four hold:
 ///   1. it spans more than one grid row (otherwise it drives no fold);
-///   2. it spans at most HALF the grid's rows — a row GROUP is a few rows;
-///      a rect covering most rows is a frame or page background, a different
-///      category handled by `detect_table_from_rect_group`'s
-///      `FewNonEmptyRows` retry;
-///   3. it covers at least three columns — a floor that keeps a legitimate
-///      2x2 merge in a small grid out of the net; and
-///   4. it covers a strict majority of all columns.
+///   2. it covers at least three columns — a floor that keeps a legitimate
+///      2x2 merge in a small grid out of the net;
+///   3. it covers a strict majority of all columns; and
+///   4. EITHER it spans at most half the grid's rows, OR it passes the
+///      content-and-subdivision test described below.
+///
+/// Clause 4 used to be the row-count half alone, and that was wrong in
+/// principle. Row count is a bad proxy for decoration: a shading pattern
+/// painted behind MOST of a table is still decoration, and the old rule
+/// handed exactly those bands to `propagate_merged_cells` to be folded as
+/// merges, destroying every banded row's text. (The claim that
+/// `detect_table_from_rect_group`'s `FewNonEmptyRows` retry caught the case
+/// was wrong too — columns outside the band keep every row non-empty, so
+/// that retry never fires.)
+///
+/// The replacement asks what a merge actually means, and takes two
+/// independent kinds of evidence, both required:
+///
+/// **Content.** A merged cell holds ONE run of content — that is what being
+/// merged means — so the rows it covers do not each carry their own value. A
+/// band painted behind real rows sits over cells that each already hold their
+/// own distinct text, put there by text position alone and entirely
+/// independently of this rect. So: for each column the rect covers, count how
+/// many of the rows it covers hold non-empty text in that column, and require
+/// a MAJORITY of the covered columns to have two or more. The per-column
+/// majority is what survives the wrapped-continuation case that rules the
+/// same test out for `non_merge_evidence_rects`' multi-row spans: a genuine
+/// rowspan whose value wraps onto a second line does populate two of its
+/// sub-rows, but in the ONE merged column, never across a majority of a
+/// band's columns.
+///
+/// **Subdivision.** The rect's own area must contain two or more vertically
+/// disjoint smaller rects. A band is painted BEHIND the table's per-cell
+/// rects, so those rects sit inside it; a genuine merged cell has no per-cell
+/// rects inside it, because being merged is precisely the absence of that
+/// subdivision. Content alone cannot separate the two — a block of several
+/// merged cells side by side, each holding a value that wraps, populates two
+/// rows in a majority of its columns and reads exactly like a band by the
+/// content test. It does not look like one geometrically.
+///
+/// `cells` must be the grid as assigned, BEFORE any fold rewrites it.
 ///
 /// The asymmetry is chosen on purpose: misreading decoration as a merge
 /// DESTROYS text, while failing to fold a genuine merge merely leaves text
-/// where it already was.
+/// where it already was. That is also why clause 4 keeps the old row-count
+/// rule as an alternative rather than dropping it — it only ever classifies
+/// MORE rects as decoration, so nothing that was safe before becomes a fold.
 fn decorative_fill_rects(
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
     col_edges: &[f32],
     row_edges: &[f32],
+    cells: &[Vec<String>],
 ) -> Vec<bool> {
     let num_cols = col_edges.len().saturating_sub(1);
     let num_rows = row_edges.len().saturating_sub(1);
@@ -1993,13 +2051,64 @@ fn decorative_fill_rects(
             if skip_rects.get(idx).copied().unwrap_or(false) {
                 return true;
             }
+            let (rx, ry, rw, rh) = rect;
             let (cols_covered, rows_spanned) = rect_span_counts(rect, col_edges, row_edges);
-            if rows_spanned < 2 {
+            if rows_spanned < 2 || cols_covered < 3 || cols_covered * 2 <= num_cols {
                 return false;
             }
-            rows_spanned * 2 <= num_rows && cols_covered >= 3 && cols_covered * 2 > num_cols
+            if rows_spanned * 2 <= num_rows {
+                return true;
+            }
+            let rows: Vec<usize> = (0..num_rows)
+                .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
+                .collect();
+            let cols: Vec<usize> = (0..num_cols)
+                .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
+                .collect();
+            let self_populated = cols
+                .iter()
+                .filter(|&&c| {
+                    rows.iter()
+                        .filter(|&&r| {
+                            cells
+                                .get(r)
+                                .and_then(|row| row.get(c))
+                                .is_some_and(|text| !text.trim().is_empty())
+                        })
+                        .count()
+                        >= 2
+                })
+                .count();
+            self_populated * 2 > cols.len() && contains_stacked_subrects(rect, group_rects)
         })
         .collect()
+}
+
+/// Whether `rect` strictly contains two or more smaller rects that do not
+/// overlap each other vertically — i.e. its interior is really divided into
+/// rows by other geometry, rather than being one undivided area.
+fn contains_stacked_subrects(
+    rect: (f32, f32, f32, f32),
+    group_rects: &[(f32, f32, f32, f32)],
+) -> bool {
+    const TOL: f32 = 2.0;
+    let (rx, ry, rw, rh) = rect;
+    let inner: Vec<(f32, f32, f32, f32)> = group_rects
+        .iter()
+        .copied()
+        .filter(|&(ax, ay, aw, ah)| {
+            rw * rh > aw * ah * 1.2
+                && rx <= ax + TOL
+                && (rx + rw) >= (ax + aw) - TOL
+                && ry <= ay + TOL
+                && (ry + rh) >= (ay + ah) - TOL
+        })
+        .collect();
+    inner.iter().enumerate().any(|(i, &a)| {
+        inner[i + 1..]
+            .iter()
+            .any(|&b| a.1 + a.3 <= b.1 + TOL || b.1 + b.3 <= a.1 + TOL)
+    })
 }
 
 /// Rects that must not be treated as per-cell MERGE EVIDENCE, as a mask
@@ -2042,7 +2151,7 @@ fn non_merge_evidence_rects(
 ) -> Vec<bool> {
     let num_cols = col_edges.len().saturating_sub(1);
     let num_rows = row_edges.len().saturating_sub(1);
-    let decorative = decorative_fill_rects(group_rects, skip_rects, col_edges, row_edges);
+    let decorative = decorative_fill_rects(group_rects, skip_rects, col_edges, row_edges, cells);
 
     group_rects
         .iter()

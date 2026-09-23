@@ -10979,33 +10979,51 @@ fn test_page_geometry_mem_real_document_shading_bands_are_not_merges() {
 /// the 12 columns folds its two banded rows together and the table loses two
 /// non-empty rows.
 fn make_wide_shaded_table_pdf() -> Vec<u8> {
-    const COLS: usize = 12;
-    const ROWS: usize = 6;
+    make_shaded_table_pdf(12, 6, &[(1, 2), (3, 4)], 0, 12)
+}
+
+/// General form of the shape above: a `cols` x `rows` grid of per-cell `re`
+/// rects with shading bands painted BEHIND it, each band covering grid rows
+/// `first..=last` and grid columns `band_c0..band_c1` (exclusive).
+///
+/// The band's column range matters as much as its row range. A band covering
+/// the table's FULL width is dropped long before any decoration predicate by
+/// the "wider than 10x the median rect width" size filter, which is why the
+/// original 12-column fixture never reached the code it claimed to test. A
+/// band narrower than that filter's threshold survives it and actually
+/// reaches the grid builder.
+fn make_shaded_table_pdf(
+    cols: usize,
+    rows: usize,
+    bands: &[(usize, usize)],
+    band_c0: usize,
+    band_c1: usize,
+) -> Vec<u8> {
     const COL_W: f32 = 40.0;
     const ROW_H: f32 = 30.0;
     const X0: f32 = 30.0;
-    const Y0: f32 = 200.0;
+    const Y0: f32 = 60.0;
 
-    let row_y = |r: usize| Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+    let row_y = |r: usize| Y0 + (rows - 1 - r) as f32 * ROW_H;
 
     let mut content = String::from("q\n");
-    // Shading bands FIRST (painted behind), covering rows 1..=2 and 3..=4.
+    // Shading bands FIRST (painted behind).
     content.push_str("0.92 0.92 0.92 rg\n");
-    for &(first, last) in &[(1usize, 2usize), (3usize, 4usize)] {
+    for &(first, last) in bands {
         let y = row_y(last);
         let h = (last - first + 1) as f32 * ROW_H;
         content.push_str(&format!(
             "{} {} {} {} re f\n",
-            X0,
+            X0 + band_c0 as f32 * COL_W,
             y,
-            COLS as f32 * COL_W,
+            (band_c1 - band_c0) as f32 * COL_W,
             h
         ));
     }
     // Per-cell rects on top.
     content.push_str("1 1 1 rg\n");
-    for r in 0..ROWS {
-        for c in 0..COLS {
+    for r in 0..rows {
+        for c in 0..cols {
             content.push_str(&format!(
                 "{} {} {} {} re f\n",
                 X0 + c as f32 * COL_W,
@@ -11016,8 +11034,8 @@ fn make_wide_shaded_table_pdf() -> Vec<u8> {
         }
     }
     content.push_str("Q\nBT\n/F1 8 Tf\n");
-    for r in 0..ROWS {
-        for c in 0..COLS {
+    for r in 0..rows {
+        for c in 0..cols {
             content.push_str(&format!(
                 "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
                 X0 + c as f32 * COL_W + 3.0,
@@ -11029,8 +11047,158 @@ fn make_wide_shaded_table_pdf() -> Vec<u8> {
     }
     content.push_str("ET");
 
-    let total_w = X0 * 2.0 + COLS as f32 * COL_W;
-    make_text_pdf(&content, &format!("0 0 {} 400", total_w))
+    let total_w = X0 * 2.0 + cols as f32 * COL_W;
+    let total_h = Y0 * 2.0 + rows as f32 * ROW_H;
+    make_text_pdf(&content, &format!("0 0 {} {}", total_w, total_h))
+}
+
+/// Row-by-row text of the rect-detected grid in a one-table fixture.
+fn shaded_table_cells(pdf: &[u8]) -> Vec<Vec<String>> {
+    let pages = page_geometry_mem(pdf).expect("geometry extraction should succeed");
+    let table = pages[0]
+        .tables
+        .iter()
+        .find(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .expect("the rect grid must be detected");
+    table.cells.clone()
+}
+
+fn non_empty_row_count(cells: &[Vec<String>]) -> usize {
+    cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count()
+}
+
+/// Every cell must still hold its OWN coordinates -- proving no row was
+/// folded into another, not merely that N rows are non-empty.
+fn assert_cells_intact(cells: &[Vec<String>], rows: usize, cols: usize, what: &str) {
+    assert_eq!(cells.len(), rows, "{what}: row count. Got {cells:?}");
+    for (r, row) in cells.iter().enumerate() {
+        assert_eq!(row.len(), cols, "{what}: column count in row {r}");
+        for (c, cell) in row.iter().enumerate() {
+            assert_eq!(
+                cell.trim(),
+                format!("R{r}C{c}"),
+                "{what}: row {r} col {c} was altered. Got {cells:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocker 1 (round 3): a band covering MORE than half the rows is still
+// decoration. These bands are 5 or more cell-heights tall, so they clear the
+// contained-sub-rect dedup's `bh < ah * 4.0` gate untouched -- the ONLY thing
+// that could fold them is the decoration predicate's old row-count clause,
+// and reverting that clause makes every case here fail. Verified by doing it,
+// not asserted. Keeping these bands 5+ rows tall is deliberate: it isolates
+// this fix from the separate, unfixed dedup defect the ignored test below
+// reproduces, and one fixture cannot prove two independent things.
+// ---------------------------------------------------------------------------
+
+/// (name, cols, rows, bands, band_c0, band_c1)
+type ShadedCase = (
+    &'static str,
+    usize,
+    usize,
+    &'static [(usize, usize)],
+    usize,
+    usize,
+);
+
+#[test]
+fn test_band_covering_most_rows_is_decoration_not_merge() {
+    // Hardik's round-3 repro table, reproduced as real PDFs. The band stays
+    // inside the 10x-median width filter (9 columns x 40pt = 360 <= 400), so
+    // it genuinely reaches `decorative_fill_rects`.
+    let cases: [ShadedCase; 3] = [
+        ("band behind all 6 rows", 12, 6, &[(0, 5)], 1, 10),
+        ("band behind body rows 1-5 of 6", 12, 6, &[(1, 5)], 1, 10),
+        ("12x10, band over rows 2-8", 12, 10, &[(2, 8)], 1, 10),
+    ];
+    for (name, cols, rows, bands, c0, c1) in cases {
+        let pdf = make_shaded_table_pdf(cols, rows, bands, c0, c1);
+        let cells = shaded_table_cells(&pdf);
+        assert!(
+            cells[0].len() >= 11,
+            "{name}: fixture must exercise the wide (>10-column) path; got {} columns",
+            cells[0].len()
+        );
+        assert_cells_intact(&cells, rows, cols, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocker 2 (round 3): NOT FIXED, reproduced. Bands only 2-4 cell-heights
+// tall pass the contained-sub-rect dedup's `bh < ah * 4.0` gate, so their
+// per-cell rects are stripped in `detect_rects` BEFORE any decoration
+// predicate runs: the grid never gets the row edges inside the band and the
+// banded rows collapse. Current behaviour is 6x6 -> 4 rows, 8x8 (3-row band)
+// -> 6 rows, 8x8 (4-row band) -> 8 rows.
+//
+// Two narrowings of the obvious fix ("a container whose children are
+// subdivided keeps them") were implemented and measured against the 45-PDF
+// fixture corpus, and both changed real output:
+//
+//   children disjoint in EITHER axis  -> resurrects spurious grids over
+//                                        running prose
+//                                        (td9264_insurance_prose_not_rect_table)
+//   children forming a GRID (a stacked -> still shifts cell contents across
+//   pair AND a side-by-side pair)        bits_pilani_feedback.pdf (460 diff
+//                                        lines, incl. "CS IS"/"ECO FIN"
+//                                        becoming "CS IS ECO"/"FIN")
+//
+// This test is left ignored rather than deleted: it is the reproduction, and
+// it passes the moment the dedup stops destroying the evidence. Shipping a
+// fix that trades this regression for a measured corpus regression would not
+// have been an improvement.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "blocker 2 reproduction: contained-sub-rect dedup destroys per-cell rects under short bands; see comment above"]
+fn test_short_bands_keep_their_per_cell_rects() {
+    let cases: [ShadedCase; 3] = [
+        (
+            "6x6, two full-width 2-row bands",
+            6,
+            6,
+            &[(1, 2), (3, 4)],
+            0,
+            6,
+        ),
+        ("8x8, 3-row band", 8, 8, &[(2, 4)], 0, 8),
+        ("8x8, 4-row band", 8, 8, &[(2, 5)], 0, 8),
+    ];
+    for (name, cols, rows, bands, c0, c1) in cases {
+        let pdf = make_shaded_table_pdf(cols, rows, bands, c0, c1);
+        let cells = shaded_table_cells(&pdf);
+        assert_eq!(
+            non_empty_row_count(&cells),
+            rows,
+            "{name}: all {rows} rows must survive. Got {cells:?}"
+        );
+        assert_cells_intact(&cells, rows, cols, name);
+    }
+}
+
+/// The partial-width, 2-rows-tall shape in the wide table, recorded honestly:
+/// it is GREEN on the pre-fix code too, which is precisely why it is not the
+/// proof of anything. The columns outside the band (0, 10, 11) keep their own
+/// per-cell rects through the dedup, so the row edges survive it, and a 2-row
+/// band satisfies the old row-count clause, so the predicate already spared
+/// it. Kept as an end-to-end guard; the test above it is what actually fails
+/// without the fix.
+#[test]
+fn test_partial_width_two_row_band_in_wide_table_keeps_every_row() {
+    let pdf = make_shaded_table_pdf(12, 6, &[(1, 2)], 1, 10);
+    let cells = shaded_table_cells(&pdf);
+    assert!(
+        cells[0].len() >= 11,
+        "fixture must exercise the wide (>10-column) path; got {} columns",
+        cells[0].len()
+    );
+    assert_cells_intact(&cells, 6, 12, "partial-width 2-row band");
 }
 
 #[test]
@@ -11098,7 +11266,7 @@ fn test_page_geometry_mem_wide_table_gets_real_merge_occupancy() {
     // got folded, and their cell_occupancy carried no merge evidence at all.
     //
     // This builds an 18-column x 3-row grid (well past the old 10-column
-    // cutoff, comfortably under the outer 25-column structural cap) where
+    // cutoff, comfortably under MAX_TABLE_COLUMNS) where
     // column 0 has ONE real `re` rect spanning rows 1 and 2 (a genuine
     // rowspan), and every other column has ordinary, unmerged per-row rects.
     const NUM_DATA_COLS: usize = 17; // plus column 0 = 18 total
