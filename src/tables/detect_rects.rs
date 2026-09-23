@@ -6,7 +6,7 @@ use log::debug;
 
 use crate::types::{PdfRect, TextItem};
 
-use super::{CellOccupancy, CellRect, Table, TableSource};
+use super::{CellOccupancy, CellRect, Table, TableSource, MAX_TABLE_COLUMNS};
 
 const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
 const COMPETING_TABLE_MIN_ROWS: usize = 8;
@@ -1516,9 +1516,16 @@ fn try_build_grid(
 
     // Reject grids that are too large — form-style PDFs with scattered field
     // boxes produce huge sparse grids.  Statistical lookup tables (e.g. MWU,
-    // chi-square) can legitimately have 20+ columns, so allow up to 25.
-    if num_cols > 25 {
-        debug!("  rejected: {} columns > 25", num_cols);
+    // chi-square) can legitimately have 20+ columns, and one-bit-per-column
+    // hardware register/bitfield tables (a 32-bit register documented as
+    // Offset + Register + one column per bit is 34 columns) routinely run
+    // into the high 30s — hence `MAX_TABLE_COLUMNS`. The real defence
+    // against the scattered-field-box false positive is the
+    // `fill_ratio < 0.3` check just below, not this raw column count: a wide
+    // grid of real cells still has to be backed by rects that actually fill
+    // it.
+    if num_cols > MAX_TABLE_COLUMNS {
+        debug!("  rejected: {} columns > {}", num_cols, MAX_TABLE_COLUMNS);
         return GridResult::Failed;
     }
 
@@ -1583,12 +1590,28 @@ fn try_build_grid(
 
     // Consolidate vertically-merged cells: rects spanning multiple grid rows
     // should have their text collected into the first sub-row.
-    // Skip for wide tables (>10 columns) where spanning rects are typically
-    // background fills rather than true merged cells (e.g. statistical lookup
-    // tables with row-grouping shading).
-    if num_cols <= 10 {
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects);
-    }
+    //
+    // This used to be skipped outright for any table with >10 columns, on
+    // the theory that a multi-row rect in a wide table is row-grouping
+    // shading rather than a genuine merged cell. That theory named the
+    // right danger and picked the wrong remedy. It disabled real rowspans
+    // in wide register/bitfield tables wholesale, and — because the danger
+    // is not a property of column count — it left the identical corruption
+    // in place for narrow tables, where the guard let propagation run.
+    //
+    // The remedy is `decorative_fill_rects`: a column-count-independent
+    // predicate over the real geometry, excluding exactly the rects the
+    // guard was gesturing at. It is the multi-row half of the same
+    // decoration concept `non_merge_evidence_rects` above is built on, not
+    // a second predicate.
+    let merge_excluded = decorative_fill_rects(group_rects, skip_rects, &col_edges, &row_edges);
+    propagate_merged_cells(
+        &mut cells,
+        &col_edges,
+        &row_edges,
+        group_rects,
+        &merge_excluded,
+    );
 
     // Compute column centers and row centers for the Table struct
     let columns: Vec<f32> = (0..num_cols)
@@ -5242,6 +5265,256 @@ mod tests {
             GridResult::Failed => {}
             _ => panic!("Expected Failed with no items"),
         }
+    }
+
+    /// Build a synthetic N-column x 3-row grid of fully-filled rects (one
+    /// rect per cell) plus one text item per cell, so both the grid-size
+    /// cap and the fill-ratio check see a real, dense table rather than a
+    /// sparse one. Column `i` spans `x = i*col_w .. (i+1)*col_w`. 3 rows
+    /// (not 2) because `try_build_grid` requires >= 4 Y edges (>= 3 rows).
+    fn make_wide_grid_rects(num_cols: usize, col_w: f32) -> Vec<(f32, f32, f32, f32)> {
+        let mut rects = Vec::with_capacity(num_cols * 3);
+        for row in 0..3 {
+            let y = row as f32 * 20.0;
+            for col in 0..num_cols {
+                rects.push((col as f32 * col_w, y, col_w, 20.0));
+            }
+        }
+        rects
+    }
+
+    fn make_wide_grid_items(num_cols: usize, col_w: f32) -> Vec<TextItem> {
+        let mut items = Vec::with_capacity(num_cols * 3);
+        for row in 0..3 {
+            let y = row as f32 * 20.0 + 10.0;
+            for col in 0..num_cols {
+                let x = col as f32 * col_w + col_w * 0.25;
+                let text = if row == 2 {
+                    format!("{}", (num_cols - 1).saturating_sub(col))
+                } else {
+                    "0".to_string()
+                };
+                items.push(make_item(&text, x, y, 6.0));
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn test_try_build_grid_34_col_bitfield_table_detected() {
+        // Real-world shape: Offset, Register, plus one column per bit
+        // (31 down to 0) = 34 columns total, densely filled — the register
+        // bitfield table this cap raise exists for.
+        let num_cols = 34;
+        let col_w = 10.0;
+        let group_rects = make_wide_grid_rects(num_cols, col_w);
+        let items = make_wide_grid_items(num_cols, col_w);
+        let skip = vec![false; group_rects.len()];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Ok(table) => {
+                assert_eq!(table.columns.len(), num_cols);
+            }
+            other => panic!("expected a 34-column bitfield table to be detected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_above_new_cap_still_rejected() {
+        // 45 columns exceeds MAX_TABLE_COLUMNS even though the grid is
+        // fully, densely filled — the cap itself must still bite for
+        // implausibly wide grids, it was raised, not removed.
+        let num_cols = MAX_TABLE_COLUMNS + 5;
+        let col_w = 10.0;
+        let group_rects = make_wide_grid_rects(num_cols, col_w);
+        let items = make_wide_grid_items(num_cols, col_w);
+        let skip = vec![false; group_rects.len()];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Failed => {}
+            other => panic!("expected Failed for a {num_cols}-column grid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_build_grid_scattered_decorative_boxes_still_rejected() {
+        // Genuinely scattered, non-grid-aligned decorative boxes (the
+        // "form-style PDF with scattered field boxes" case the column cap
+        // exists to guard against) — irregular spacing and heights, no two
+        // rects sharing a real row or column line, unlike a real bitfield
+        // table (a dense, aligned grid). This must still be rejected after
+        // the column-count cap was raised for real wide tables.
+        let mut group_rects: Vec<(f32, f32, f32, f32)> = Vec::new();
+        let mut items: Vec<TextItem> = Vec::new();
+        for i in 0..40 {
+            let x = i as f32 * 37.3;
+            let y = (i as f32 * 53.7) % 400.0;
+            group_rects.push((x, y, 9.0, 7.0));
+            items.push(make_item("x", x + 2.0, y + 2.0, 6.0));
+        }
+        let skip = vec![false; group_rects.len()];
+        match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Failed => {}
+            other => {
+                panic!("expected scattered decorative boxes to still be rejected, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_genuine_narrow_rowspan_in_a_wide_table_still_propagates() {
+        // The other half of the finding-1 fix: suppressing decorative bands
+        // must not suppress real merges. A 20-column grid with ONE rect
+        // spanning two rows in column 0 is a genuine rowspan — 1 of 20
+        // columns, nowhere near the majority a shading band covers — and
+        // must still fold, which the old `num_cols <= 10` guard prevented.
+        const NUM_COLS: usize = 20;
+        const COL_W: f32 = 20.0;
+        const ROW_H: f32 = 30.0;
+        let row_y = |r: usize| (2 - r) as f32 * ROW_H;
+
+        let mut rects = Vec::new();
+        for r in 0..3 {
+            for c in 0..NUM_COLS {
+                rects.push((c as f32 * COL_W, row_y(r), COL_W, ROW_H));
+            }
+        }
+        // Genuine rowspan: column 0, rows 1..=2.
+        rects.push((0.0, row_y(2), COL_W, 2.0 * ROW_H));
+
+        let mut items = Vec::new();
+        for r in 0..3 {
+            for c in 0..NUM_COLS {
+                items.push(make_item(
+                    &format!("R{r}C{c}"),
+                    c as f32 * COL_W + 2.0,
+                    row_y(r) + 10.0,
+                    6.0,
+                ));
+            }
+        }
+
+        let skip = vec![false; rects.len()];
+        let table = match try_build_grid(&items, &rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the 20-column grid to build, got {other:?}"),
+        };
+        assert_eq!(
+            table.cells[1][0], "R1C0 R2C0",
+            "a genuine single-column rowspan in a wide table must still fold"
+        );
+        assert_eq!(table.cells[2][0], "");
+        // and the untouched columns keep their own per-row text.
+        assert_eq!(table.cells[1][1], "R1C1");
+        assert_eq!(table.cells[2][1], "R2C1");
+    }
+
+    /// Reviewer finding 1's reproduction shape, at the level the grid
+    /// builder actually sees: a 12-column x 6-row table of per-cell rects
+    /// plus two FULL-WIDTH shading bands, each covering two adjacent data
+    /// rows.
+    ///
+    /// Returns `(items, group_rects)`. `try_build_grid` is called with
+    /// `skip_rects` all-false, which is exactly what
+    /// `detect_table_from_rect_group`'s first pass passes -- the comment
+    /// justifying the removal of the `num_cols <= 10` guard claimed
+    /// `skip_rects` already filters background fills, and it does not.
+    fn make_wide_shaded_grid(
+        num_cols: usize,
+        num_rows: usize,
+    ) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        const COL_W: f32 = 40.0;
+        const ROW_H: f32 = 30.0;
+        let row_y = |r: usize| (num_rows - 1 - r) as f32 * ROW_H;
+
+        let mut rects = Vec::new();
+        // Two full-width shading bands: rows 1..=2 and 3..=4.
+        for &(first, last) in &[(1usize, 2usize), (3usize, 4usize)] {
+            rects.push((
+                0.0,
+                row_y(last),
+                num_cols as f32 * COL_W,
+                (last - first + 1) as f32 * ROW_H,
+            ));
+        }
+        // Per-cell rects.
+        for r in 0..num_rows {
+            for c in 0..num_cols {
+                rects.push((c as f32 * COL_W, row_y(r), COL_W, ROW_H));
+            }
+        }
+
+        let mut items = Vec::new();
+        for r in 0..num_rows {
+            for c in 0..num_cols {
+                items.push(make_item(
+                    &format!("R{r}C{c}"),
+                    c as f32 * COL_W + 3.0,
+                    row_y(r) + 10.0,
+                    8.0,
+                ));
+            }
+        }
+        (items, rects)
+    }
+
+    #[test]
+    fn test_wide_table_full_width_shading_bands_do_not_merge_rows() {
+        // Reviewer finding 1, the confirmed data-loss regression. With the
+        // `num_cols <= 10` guard removed and no decorative-fill predicate,
+        // both shading bands are read as genuine merge rects in all 12
+        // columns, folding 6 data rows into 4.
+        let (items, group_rects) = make_wide_shaded_grid(12, 6);
+        let skip = vec![false; group_rects.len()];
+        let table = match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the 12x6 grid to build, got {other:?}"),
+        };
+
+        let non_empty_rows = table
+            .cells
+            .iter()
+            .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+            .count();
+        assert_eq!(
+            non_empty_rows, 6,
+            "full-width shading bands are decoration, not merges: all 6 rows \
+             must survive, got {non_empty_rows}. cells={:?}",
+            table.cells
+        );
+        for (r, row) in table.cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert_eq!(
+                    cell.trim(),
+                    format!("R{r}C{c}"),
+                    "row {r} col {c} was altered by shading-band merge propagation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_narrow_table_full_width_shading_bands_do_not_merge_rows() {
+        // The same defect is not a property of WIDE tables: at 6 columns the
+        // old `num_cols <= 10` guard let merge propagation run, so a
+        // narrow table with the identical shading was corrupted on main too.
+        // The decorative-fill predicate is column-count independent, so it
+        // fixes both.
+        let (items, group_rects) = make_wide_shaded_grid(6, 6);
+        let skip = vec![false; group_rects.len()];
+        let table = match try_build_grid(&items, &group_rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the 6x6 grid to build, got {other:?}"),
+        };
+        let non_empty_rows = table
+            .cells
+            .iter()
+            .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+            .count();
+        assert_eq!(
+            non_empty_rows, 6,
+            "narrow table with the same shading must keep all 6 rows, got \
+             {non_empty_rows}. cells={:?}",
+            table.cells
+        );
     }
 
     #[test]

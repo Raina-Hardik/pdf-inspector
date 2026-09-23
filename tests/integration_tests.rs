@@ -10965,3 +10965,269 @@ fn test_page_geometry_mem_real_document_shading_bands_are_not_merges() {
         "fixture must exercise fully-covered rows, else the assertion never ran"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reviewer finding 1 — wide tables with row shading must not lose rows
+// ---------------------------------------------------------------------------
+
+/// Hardik's reproduction shape, as a real PDF content stream: a 12-column x
+/// 6-row table of per-cell `re` rects, with two FULL-WIDTH shading bands
+/// painted behind it, each covering two adjacent data rows (the row-grouping
+/// shading a statistical/register table typically carries).
+///
+/// The bands are decoration. If they are read as merge rects, every one of
+/// the 12 columns folds its two banded rows together and the table loses two
+/// non-empty rows.
+fn make_wide_shaded_table_pdf() -> Vec<u8> {
+    const COLS: usize = 12;
+    const ROWS: usize = 6;
+    const COL_W: f32 = 40.0;
+    const ROW_H: f32 = 30.0;
+    const X0: f32 = 30.0;
+    const Y0: f32 = 200.0;
+
+    let row_y = |r: usize| Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+
+    let mut content = String::from("q\n");
+    // Shading bands FIRST (painted behind), covering rows 1..=2 and 3..=4.
+    content.push_str("0.92 0.92 0.92 rg\n");
+    for &(first, last) in &[(1usize, 2usize), (3usize, 4usize)] {
+        let y = row_y(last);
+        let h = (last - first + 1) as f32 * ROW_H;
+        content.push_str(&format!(
+            "{} {} {} {} re f\n",
+            X0,
+            y,
+            COLS as f32 * COL_W,
+            h
+        ));
+    }
+    // Per-cell rects on top.
+    content.push_str("1 1 1 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "{} {} {} {} re f\n",
+                X0 + c as f32 * COL_W,
+                row_y(r),
+                COL_W,
+                ROW_H
+            ));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 8 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
+                X0 + c as f32 * COL_W + 3.0,
+                row_y(r) + 10.0,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+
+    let total_w = X0 * 2.0 + COLS as f32 * COL_W;
+    make_text_pdf(&content, &format!("0 0 {} 400", total_w))
+}
+
+#[test]
+fn test_wide_table_with_full_width_shading_keeps_every_row() {
+    // Reviewer finding 1. Lifting the `num_cols <= 10` merge-propagation
+    // guard made full-width row-shading bands read as genuine merge rects
+    // in wide tables: `skip_rects` does NOT filter them (the first
+    // detection pass passes all-false, and the retry only skips rects near
+    // the page origin), so every column folded its two banded rows
+    // together. Base kept 6 non-empty rows; the unguarded version kept 4.
+    //
+    // The fix is a real decorative-fill predicate that is independent of
+    // column count, not a reinstated column cap: wide register/bitfield
+    // tables need merge propagation too.
+    let pdf = make_wide_shaded_table_pdf();
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    eprintln!("INSTRRECTS n={}", pages[0].rects.len());
+    for r in &pages[0].rects {
+        if r.width > 200.0 {
+            eprintln!("INSTRWIDE {:?}", (r.x, r.y, r.width, r.height));
+        }
+    }
+    let table = pages[0]
+        .tables
+        .iter()
+        .find(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .expect("the 12x6 rect grid must be detected");
+
+    assert!(
+        table.cells[0].len() >= 11,
+        "fixture must exercise the wide (>10-column) path; got {} columns",
+        table.cells[0].len()
+    );
+
+    let non_empty_rows = table
+        .cells
+        .iter()
+        .filter(|row| row.iter().any(|c| !c.trim().is_empty()))
+        .count();
+    assert_eq!(
+        non_empty_rows, 6,
+        "full-width shading bands are decoration, not merges: all 6 data \
+         rows must survive. Got {} rows: {:?}",
+        non_empty_rows, table.cells
+    );
+
+    // Every data cell must still hold its own row's text -- proving rows
+    // were not folded, not merely that six rows are non-empty.
+    for (r, row) in table.cells.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            assert_eq!(
+                cell.trim(),
+                format!("R{}C{}", r, c),
+                "row {} col {} was altered by shading-band merge propagation",
+                r,
+                c
+            );
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_wide_table_gets_real_merge_occupancy() {
+    // Regression test: `propagate_merged_cells` used to be skipped entirely
+    // for any table with >10 columns, on the theory that a rect spanning
+    // multiple rows in a wide table is a background fill (row-grouping
+    // shading in a statistical lookup table) rather than a genuine merge.
+    // Register-bitfield-style specs (e.g. STM32-style tables with one
+    // narrow column per bit position) are exactly the wide-but-narrow-column
+    // shape that guard blanket-penalized: real rowspans in such tables never
+    // got folded, and their cell_occupancy carried no merge evidence at all.
+    //
+    // This builds an 18-column x 3-row grid (well past the old 10-column
+    // cutoff, comfortably under the outer 25-column structural cap) where
+    // column 0 has ONE real `re` rect spanning rows 1 and 2 (a genuine
+    // rowspan), and every other column has ordinary, unmerged per-row rects.
+    const NUM_DATA_COLS: usize = 17; // plus column 0 = 18 total
+    const COL_W: f32 = 30.0;
+    const ROW_H: f32 = 40.0;
+
+    let mut content = String::from("q\n0 0 0 rg\n");
+    // Column 0: header rect + one rect spanning rows 1+2 (the real rowspan).
+    content.push_str(&format!("0 {} {} {} re f\n", 2.0 * ROW_H, COL_W, ROW_H)); // row0
+    content.push_str(&format!("0 {} {} {} re f\n", 0.0, COL_W, 2.0 * ROW_H)); // rows1+2 merged
+                                                                              // Columns 1..=17: three ordinary per-row rects each.
+    for c in 1..=NUM_DATA_COLS {
+        let x = c as f32 * COL_W;
+        for row in 0..3 {
+            let y = (2 - row) as f32 * ROW_H;
+            content.push_str(&format!("{} {} {} {} re f\n", x, y, COL_W, ROW_H));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 8 Tf\n");
+    // Header text.
+    content.push_str(&format!(
+        "1 0 0 1 {} {} Tm (H0) Tj\n",
+        3.0,
+        2.0 * ROW_H + 15.0
+    ));
+    for c in 1..=NUM_DATA_COLS {
+        let x = c as f32 * COL_W + 3.0;
+        content.push_str(&format!(
+            "1 0 0 1 {} {} Tm (H{}) Tj\n",
+            x,
+            2.0 * ROW_H + 15.0,
+            c
+        ));
+    }
+    // Column 0 data text: "M1" in row1's band, "M2" in row2's band — the
+    // genuine rowspan `propagate_merged_cells` must fold together.
+    content.push_str(&format!("1 0 0 1 {} {} Tm (M1) Tj\n", 3.0, ROW_H + 15.0));
+    content.push_str(&format!("1 0 0 1 {} {} Tm (M2) Tj\n", 3.0, 15.0));
+    // Ordinary per-row data text for columns 1..=17.
+    for c in 1..=NUM_DATA_COLS {
+        let x = c as f32 * COL_W + 3.0;
+        content.push_str(&format!("1 0 0 1 {} {} Tm (D{}a) Tj\n", x, ROW_H + 15.0, c));
+        content.push_str(&format!("1 0 0 1 {} {} Tm (D{}b) Tj\n", x, 15.0, c));
+    }
+    content.push_str("ET");
+
+    let total_w = (NUM_DATA_COLS + 1) as f32 * COL_W;
+    let media_box = format!("0 0 {} 200", total_w);
+    let pdf = make_text_pdf(&content, &media_box);
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+
+    let table = pages[0]
+        .tables
+        .iter()
+        .find(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .expect("a real re-rect-backed wide table should be detected from this fixture");
+
+    assert!(
+        table.cells[0].len() > 10,
+        "fixture must exercise the >10-column path this test targets; got {} columns",
+        table.cells[0].len()
+    );
+
+    let occ = table
+        .cell_occupancy
+        .as_ref()
+        .expect("cell_occupancy should be populated for a wide Rects-source table");
+
+    // Column 0's merge must actually have been folded: this is the crux of
+    // the regression — before the fix, wide tables never called
+    // `propagate_merged_cells` at all, so "M2" would still sit in its own
+    // row2/col0 cell instead of being combined into row1/col0.
+    assert_eq!(
+        table.cells[1][0], "M1 M2",
+        "genuine rowspan in a wide table must still be folded into the target row"
+    );
+    assert_eq!(
+        table.cells[2][0], "",
+        "the cleared sub-row of a genuine wide-table rowspan must be empty"
+    );
+
+    let target = &occ[1][0];
+    assert!(
+        !target.is_own,
+        "wide-table merge fold-in target must report is_own=false, not blanket is_own=true"
+    );
+    let target_rect = target
+        .rect
+        .expect("wide-table merge target must carry the real covering rect, not None");
+    assert!(
+        target_rect.height > ROW_H * 1.5,
+        "wide-table merge target's rect must reflect the real merged extent (~{}), got height={}",
+        2.0 * ROW_H,
+        target_rect.height
+    );
+
+    let cleared = &occ[2][0];
+    assert!(
+        !cleared.is_own,
+        "wide-table cleared merge sub-row must report is_own=false"
+    );
+    assert!(cleared.rect.is_some());
+
+    // Ordinary (non-merged) columns must be unaffected: real per-row cells,
+    // is_own=true, single-slot rects, distinct row text preserved.
+    for c in 1..=NUM_DATA_COLS {
+        assert_eq!(table.cells[1][c], format!("D{}a", c));
+        assert_eq!(table.cells[2][c], format!("D{}b", c));
+        assert!(
+            occ[1][c].is_own,
+            "ordinary wide-table column {} row1 must be is_own=true",
+            c
+        );
+        assert!(
+            occ[2][c].is_own,
+            "ordinary wide-table column {} row2 must be is_own=true",
+            c
+        );
+        let r1 = occ[1][c].rect.expect("ordinary cell must carry a rect");
+        assert!(
+            r1.height <= ROW_H * 1.2,
+            "ordinary wide-table cell's rect must be a single grid slot, not a merged extent"
+        );
+    }
+}

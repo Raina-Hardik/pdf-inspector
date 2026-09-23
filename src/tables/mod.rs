@@ -1590,6 +1590,19 @@ pub struct CellOccupancy {
     pub rect: Option<CellRect>,
 }
 
+/// Maximum number of columns any detector will accept for a real table.
+///
+/// Raised from 25 to 40 for one-bit-per-column hardware register/bitfield
+/// tables: a 32-bit register documented as `Offset | Register | bit31 ..
+/// bit0` is 34 columns, and two registers per row runs higher. Statistical
+/// lookup tables (MWU, chi-square) already reached into the 20s.
+///
+/// Single-sourced here because the three detectors previously disagreed:
+/// `detect_rects.rs` and `detect_lines.rs` were raised to 40 while
+/// `detect_heuristic.rs` was left at 25, so the same page could be a table
+/// to one detector and not to another.
+pub(crate) const MAX_TABLE_COLUMNS: usize = 40;
+
 /// A detected table.
 #[derive(Debug, Clone, Default)]
 pub struct Table {

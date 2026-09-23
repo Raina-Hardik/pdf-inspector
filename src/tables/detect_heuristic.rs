@@ -9,7 +9,7 @@ use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
     recover_header_row,
 };
-use super::{Table, TableDetectionMode, TableSource};
+use super::{Table, TableDetectionMode, TableSource, MAX_TABLE_COLUMNS};
 
 /// PDF text is often emitted as one item per glyph. That produces
 /// hundreds of single-char items that confuse column detection. This function
@@ -1350,11 +1350,12 @@ fn detect_table_in_region(
     }
     let columns = find_column_boundaries(&geometry_items, mode);
     let min_cols = 2;
-    if columns.len() < min_cols || columns.len() > 25 {
+    if columns.len() < min_cols || columns.len() > MAX_TABLE_COLUMNS {
         log::debug!(
-            "  detect_table_in_region: rejected {} cols (need {}..25)",
+            "  detect_table_in_region: rejected {} cols (need {}..{})",
             columns.len(),
-            min_cols
+            min_cols,
+            MAX_TABLE_COLUMNS
         );
         return None;
     }
