@@ -10436,37 +10436,215 @@ ET";
     assert!(occ[0][2].is_own);
 }
 
+/// A two-page document whose SECOND page carries a dense ruled-line grid
+/// drawn entirely with `m`/`l` stroke operators and **no `re` fill at all**,
+/// with one text item per cell.
+///
+/// Every row and column boundary is one full-span rule, so the page's only
+/// vector geometry is the grid itself.
+///
+/// This replaces a trimmed page pair from a proprietary vendor datasheet that
+/// cannot be redistributed. The geometry it reproduces is the part the
+/// regression is about: a table whose ONLY signal is ruled lines.
+fn synthetic_ruled_grid_second_page_pdf(num_cols: usize, num_rows: usize) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    const COL_W: i64 = 60;
+    const X0: i64 = 50;
+    const Y_TOP: i64 = 730;
+    // Deliberately NOT a constant row height. `detect_tables_from_lines`
+    // rejects a grid whose row spacing has a coefficient of variation below
+    // 0.02 as chart gridlines, and a real datasheet table's rows vary with
+    // their content. A perfectly uniform grid would be vetoed for a reason
+    // that has nothing to do with this regression.
+    const ROW_HEIGHTS: [i64; 5] = [24, 30, 26, 34, 28];
+
+    // Y of the TOP edge of row `r` (`r == num_rows` gives the bottom edge).
+    fn row_top(r: usize) -> i64 {
+        Y_TOP
+            - (0..r)
+                .map(|i| ROW_HEIGHTS[i % ROW_HEIGHTS.len()])
+                .sum::<i64>()
+    }
+
+    fn stroke(ops: &mut Vec<Operation>, ax: i64, ay: i64, bx: i64, by: i64) {
+        // A plain `m`/`l` segment — deliberately NOT `re`, which would make
+        // this a rect-detector case instead of a ruled-line one.
+        ops.push(Operation::new("m", vec![ax.into(), ay.into()]));
+        ops.push(Operation::new("l", vec![bx.into(), by.into()]));
+    }
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page1_id = doc.new_object_id();
+    let page2_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content1_id = doc.new_object_id();
+    let content2_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    // Page 1: ordinary prose, no table geometry, so the assertions below are
+    // unambiguously about page 2.
+    let mut ops1 = Vec::new();
+    ops1.push(Operation::new("BT", vec![]));
+    ops1.push(Operation::new("Tf", vec!["F1".into(), 11.into()]));
+    for (i, line) in [
+        "Device Configuration Overview",
+        "The register summary for this device is given on the following page.",
+        "Each entry lists the offset, the default value and the access policy.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ops1.push(Operation::new(
+            "Tm",
+            vec![
+                1.into(),
+                0.into(),
+                0.into(),
+                1.into(),
+                72.into(),
+                (700 - 20 * i as i64).into(),
+            ],
+        ));
+        ops1.push(Operation::new("Tj", vec![Object::string_literal(*line)]));
+    }
+    ops1.push(Operation::new("ET", vec![]));
+
+    // Page 2: the ruled grid.
+    let mut ops2 = Vec::new();
+    let x_right = X0 + num_cols as i64 * COL_W;
+    let y_bottom = row_top(num_rows);
+    for r in 0..=num_rows {
+        let y = row_top(r);
+        stroke(&mut ops2, X0, y, x_right, y);
+    }
+    for c in 0..=num_cols {
+        let x = X0 + c as i64 * COL_W;
+        stroke(&mut ops2, x, y_bottom, x, Y_TOP);
+    }
+    ops2.push(Operation::new("S", vec![]));
+
+    ops2.push(Operation::new("BT", vec![]));
+    ops2.push(Operation::new("Tf", vec!["F1".into(), 8.into()]));
+    for r in 0..num_rows {
+        for c in 0..num_cols {
+            ops2.push(Operation::new(
+                "Tm",
+                vec![
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    1.into(),
+                    (X0 + c as i64 * COL_W + 6).into(),
+                    (row_top(r + 1) + 9).into(),
+                ],
+            ));
+            ops2.push(Operation::new(
+                "Tj",
+                vec![Object::string_literal(format!("R{r}C{c}"))],
+            ));
+        }
+    }
+    ops2.push(Operation::new("ET", vec![]));
+
+    for (id, ops) in [(content1_id, ops1), (content2_id, ops2)] {
+        let content = Content { operations: ops }.encode().unwrap();
+        doc.objects
+            .insert(id, Stream::new(dictionary! {}, content).into());
+    }
+
+    for (page_id, content_id) in [(page1_id, content1_id), (page2_id, content2_id)] {
+        doc.objects.insert(
+            page_id,
+            dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => font_id,
+                    },
+                },
+                "Contents" => content_id,
+            }
+            .into(),
+        );
+    }
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page1_id.into(), page2_id.into()],
+            "Count" => 2,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
 #[test]
-fn test_page_geometry_mem_detects_ruled_line_table_intel_datasheet() {
+fn test_page_geometry_mem_detects_ruled_line_table() {
     // Regression test for the agx downstream bug report: a real ruled-grid
-    // table (Intel client datasheet, "Table 12", local page 2 of this
-    // trimmed fixture -- see testdata/corpus/samples/pdf-geometry/Intel.pdf
-    // in the agx repo for the full provenance note) has 207 `PdfLine`
-    // entries on the page forming an unmistakable 8-column x 26+-row ruled
-    // grid, but `ffi_page_geometry`'s `tables` array came back completely
-    // empty for it. Root cause: `page_geometry_mem` only ever called
-    // `detect_tables_from_rects` (filled `re` rects) and the text-density
-    // heuristic `detect_tables` -- it never called
-    // `tables::detect_tables_from_lines`, the detector that reads pure
-    // `l`-operator ruled borders. A table whose only geometry signal is
-    // ruled lines (no filled rects) was therefore invisible to every
-    // consumer of this FFI entry point, even though `pg.lines` plainly
-    // showed the grid.
-    let pdf = std::fs::read("tests/fixtures/intel_table12_ruled_grid.pdf")
-        .expect("fixture should be readable");
+    // table (8 columns, 26+ rows) had a couple of hundred `PdfLine` entries
+    // on its page forming an unmistakable grid, but `ffi_page_geometry`'s
+    // `tables` array came back completely empty for it. Root cause:
+    // `page_geometry_mem` only ever called `detect_tables_from_rects`
+    // (filled `re` rects) and the text-density heuristic `detect_tables` --
+    // it never called `tables::detect_tables_from_lines`, the detector that
+    // reads pure `l`-operator ruled borders. A table whose only geometry
+    // signal is ruled lines (no filled rects) was therefore invisible to
+    // every consumer of this FFI entry point, even though `pg.lines`
+    // plainly showed the grid.
+    //
+    // The original reproduction used a trimmed page pair from the reporting
+    // customer's vendor datasheet, which is not redistributable. The grid
+    // below is built to the same shape, with the property that matters kept
+    // exact: it is drawn with `m`/`l` only, so `detect_tables_from_rects`
+    // has nothing to work with and only the line detector can find it.
+    const COLS: usize = 8;
+    const ROWS: usize = 20;
+    let pdf = synthetic_ruled_grid_second_page_pdf(COLS, ROWS);
     let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
 
     let page2 = pages
         .iter()
         .find(|p| p.page == 2)
-        .expect("fixture should have a local page 2");
+        .expect("document should have a page 2");
 
     // Sanity: the raw ruled-grid geometry this regression is about is
-    // actually present before we assert anything about detection.
+    // actually present before we assert anything about detection. Every one
+    // of the (ROWS + 1) row rules and (COLS + 1) column rules must have
+    // survived extraction...
     assert!(
-        page2.lines.len() > 100,
-        "expected the dense ruled-grid line geometry on page 2, got {} lines",
+        page2.lines.len() >= ROWS + COLS + 2,
+        "expected the full ruled grid on page 2, got {} lines",
         page2.lines.len()
+    );
+    // ...and the rect geometry that the OTHER detector would have used is
+    // not, so a pass here cannot come from `detect_tables_from_rects`.
+    assert!(
+        page2.rects.is_empty(),
+        "the ruled grid must be lines only; got {} rects",
+        page2.rects.len()
     );
 
     let data_tables: Vec<_> = page2
@@ -10485,13 +10663,23 @@ fn test_page_geometry_mem_detects_ruled_line_table_intel_datasheet() {
             .collect::<Vec<_>>()
     );
 
-    // The grid this fixture pins is ~8 columns and well over a dozen rows
-    // (35 total rows across the two-page table per the fixture's own
-    // provenance note, most of which live on this page).
-    let table = data_tables[0];
+    // The detection must come from the ruled-line detector specifically --
+    // that is the code path the original bug never reached. A cell-per-text
+    // grid is also visible to the text-density heuristic, so this asserts
+    // that a `Lines` table is among the results rather than that it is the
+    // only one; the heuristic finding it too was never the complaint.
+    let table = *data_tables
+        .iter()
+        .find(|t| t.source == pdf_inspector::tables::TableSource::Lines)
+        .unwrap_or_else(|| {
+            panic!(
+                "the ruled grid must be found by the line detector; got sources {:?}",
+                data_tables.iter().map(|t| t.source).collect::<Vec<_>>()
+            )
+        });
     assert!(
         table.columns.len() >= 7,
-        "expected at least 7 column boundaries for the 8-edge grid, got {}",
+        "expected at least 7 column boundaries for the {COLS}-column grid, got {}",
         table.columns.len()
     );
     assert!(
