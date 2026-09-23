@@ -1585,8 +1585,17 @@ pub struct CellRect {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CellOccupancy {
     /// True when this position's geometry is its own single grid slot. False
-    /// only when a real detected rect bigger than one slot — and not
-    /// classified as table decoration — was observed covering it.
+    /// only when a real detected rect bigger than one slot was observed
+    /// covering it.
+    ///
+    /// For a multi-row rect the test is whether the merged-cell fold actually
+    /// collapsed those rows, NOT whether the decoration predicate likes the
+    /// rect: a rect the fold applied is evidence even when that predicate
+    /// would have called it a shading band, because the cell text really was
+    /// moved and `is_own = true` over moved text is a contradiction. A rect
+    /// the fold left alone is not evidence even when the predicate would have
+    /// allowed it. Single-row rects drive no fold, so for them the decoration
+    /// classification still decides.
     pub is_own: bool,
     /// The covering rect, when known: the merge rect when `!is_own`, this
     /// cell's own grid slot when `is_own` and backed by rect evidence.

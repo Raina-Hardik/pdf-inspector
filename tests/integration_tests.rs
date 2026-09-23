@@ -11578,6 +11578,87 @@ fn make_heuristic_table_pdf_with_images(image_count: usize) -> Vec<u8> {
     make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
 }
 
+/// A text-only 4-row key/value table — label column plus three numeric
+/// columns — with labels at `label_pt` and values at `value_pt`. Nothing else
+/// is on the page, so at small type the page has no body-sized text at all to
+/// compute a base font size from.
+fn make_small_type_key_value_pdf(label_pt: f32, value_pt: f32) -> Vec<u8> {
+    const COL_X: [f32; 4] = [60.0, 220.0, 340.0, 460.0];
+    const ROW_H: f32 = 20.0;
+    const Y0: f32 = 500.0;
+
+    let labels = ["Revenue", "Cost of sales", "Gross margin", "Net income"];
+    let values = [
+        ["12,481", "11,904", "10,552"],
+        ["9,033", "8,771", "8,140"],
+        ["3,448", "3,133", "2,412"],
+        ["1,207", "1,014", "876"],
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n");
+    for (r, label) in labels.iter().enumerate() {
+        let y = Y0 - r as f32 * ROW_H;
+        content.push_str(&format!(
+            "/F1 {label_pt} Tf\n1 0 0 1 {} {y} Tm ({label}) Tj\n",
+            COL_X[0]
+        ));
+        for (c, value) in values[r].iter().enumerate() {
+            content.push_str(&format!(
+                "/F1 {value_pt} Tf\n1 0 0 1 {} {y} Tm ({value}) Tj\n",
+                COL_X[c + 1]
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+#[test]
+fn test_page_geometry_mem_finds_a_small_type_table() {
+    // End-to-end guard for the small-type case. `base_font_size` comes from
+    // `calculate_font_stats_from_items`, which ignores sizes under 9pt and
+    // answers 12.0 when nothing clears that floor — so a page set entirely in
+    // 7-8pt (financial and statistical tables, routinely) is detected with a
+    // base no item on the page matches. That is not a hole: 12.0 routes every
+    // such item into the lenient small-font pass, which is exactly where they
+    // belong. `small_type_grid_needs_the_permissive_base_not_the_page_mode`
+    // in `tables::detect_heuristic` pins the arithmetic; this test pins the
+    // observable outcome through the whole geometry path.
+    let small = page_geometry_mem(&make_small_type_key_value_pdf(8.0, 7.0))
+        .expect("extraction should succeed");
+    let cells = |pages: &[pdf_inspector::PageGeometry]| -> Vec<Vec<Vec<String>>> {
+        pages[0].tables.iter().map(|t| t.cells.clone()).collect()
+    };
+    let small_cells = cells(&small);
+    assert!(
+        !small_cells.is_empty(),
+        "a 4x2 key/value table set in 7-8pt must still be found"
+    );
+    assert!(
+        small_cells
+            .iter()
+            .any(|t| t.iter().flatten().any(|c| c.contains("12,481"))),
+        "the detected table must be the small-type grid, got {small_cells:?}"
+    );
+
+    // The common case is unchanged: the same table at body size is found too,
+    // and the small-type page finds the same shape.
+    let normal = page_geometry_mem(&make_small_type_key_value_pdf(11.0, 10.0))
+        .expect("extraction should succeed");
+    let normal_cells = cells(&normal);
+    assert!(
+        !normal_cells.is_empty(),
+        "the ≥9pt control must still be found — the common case is unchanged"
+    );
+    assert_eq!(
+        small_cells.len(),
+        normal_cells.len(),
+        "small-type and body-size renderings of the same grid must agree on \
+         how many tables the page holds"
+    );
+}
+
 #[test]
 fn test_page_geometry_mem_base_font_size_ignores_image_placeholders() {
     // Blocker C, the half that changes an answer rather than only stabilising

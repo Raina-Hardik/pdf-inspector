@@ -2123,8 +2123,15 @@ fn non_merge_evidence_rects(
 /// "this position's true geometry is the recorded rect, not its own one-slot
 /// grid cell".
 ///
-/// `excluded[i]` masks rects that are not merge evidence — page backgrounds
-/// and table decoration (see [`non_merge_evidence_rects`]).
+/// `excluded[i]` masks rects that are not merge evidence. The caller decides
+/// that per rect and the rule is not uniform: a multi-row rect is masked by
+/// whether `propagate_merged_cells` actually folded its rows, so a rect the
+/// fold applied counts as evidence even when [`non_merge_evidence_rects`]
+/// would have classified it as decoration — the text really moved, and
+/// reporting `is_own = true` over moved text is the contradiction. A
+/// single-row rect drives no fold, so there the decoration classification
+/// (page backgrounds, shading bands — see [`non_merge_evidence_rects`]) is
+/// what masks it.
 ///
 /// OVERLAP RESOLUTION: when several qualifying rects cover the same cell the
 /// LARGEST-AREA rect wins, ties broken by lowest `group_rects` index. Real

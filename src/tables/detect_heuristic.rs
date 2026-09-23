@@ -3011,6 +3011,76 @@ mod tests {
         }
     }
 
+    /// A small-type page's base font size decides which of the two heuristic
+    /// passes each item can enter, and an item that enters neither is not a
+    /// candidate at all.
+    ///
+    /// Pass 1 (small-font) takes `size <= base * 0.90`; pass 2 (body-font)
+    /// takes `base * 0.85 <= size <= base * 1.05`. For an item at `s` that is
+    /// `base >= 1.111 * s` or `0.952 * s <= base <= 1.176 * s`. The two bands
+    /// OVERLAP on `[1.111s, 1.176s]`, so their union is simply
+    /// `base >= 0.952 * s`: what excludes an item is a base BELOW its own
+    /// size, and the base must therefore be an upper bound on the page's text
+    /// sizes rather than a central tendency.
+    ///
+    /// `calculate_font_stats_from_items` answers 12.0 when nothing clears its
+    /// 9pt floor, which satisfies that for any small-type page. Lowering the
+    /// base to the page's own mode does not: on a page mixing 7pt and 8pt the
+    /// mode is a tie, the tie breaks toward the smaller size, and the 8pt
+    /// items then sit below their own `0.952 * 8 = 7.62` floor — excluded
+    /// from both passes, taking the candidate count under the six-item
+    /// minimum and the table with it.
+    ///
+    /// This test exists so that fix is not re-attempted without measuring it.
+    #[test]
+    fn small_type_grid_needs_the_permissive_base_not_the_page_mode() {
+        let labels = [
+            "Total revenue, net of allowances",
+            "Cost of sales and related expense",
+            "Gross margin before tax provision",
+            "Net income attributable to parent",
+        ];
+        let values = ["12,481.55", "9,033.10", "3,448.45", "1,207.02"];
+        let grid = |label_pt: f32, value_pt: f32| -> Vec<TextItem> {
+            let mut items = Vec::new();
+            for (r, label) in labels.iter().enumerate() {
+                let y = 500.0 - r as f32 * 14.0;
+                items.push(make_item(
+                    label,
+                    60.0,
+                    y,
+                    label_pt,
+                    label.len() as f32 * label_pt * 0.5,
+                ));
+                items.push(make_item(values[r], 300.0, y, value_pt, 40.0));
+            }
+            items
+        };
+
+        // Entirely 7-8pt, the shape small-type financial tables take.
+        let mixed = grid(8.0, 7.0);
+        let uniform = grid(7.6, 7.6);
+
+        // The 12.0 fallback is above every item's floor, and finds both.
+        assert_eq!(detect_tables(&mixed, 12.0, false).len(), 1);
+        assert_eq!(detect_tables(&uniform, 12.0, false).len(), 1);
+
+        // The page's own mode loses the mixed one: the 7.0/8.0 tie breaks to
+        // 7.0, which is below the 8pt labels' own 7.62 floor, so they are not
+        // candidates for either pass.
+        assert_eq!(
+            detect_tables(&mixed, 7.0, false).len(),
+            0,
+            "if this now finds the table the dead zone has moved — re-measure \
+             before changing the per-page base"
+        );
+        assert_eq!(detect_tables(&uniform, 7.6, false).len(), 1);
+
+        // It is the tie-break direction, not smallness, that loses it: the
+        // same page at base 8.0 — above every item's floor — is found again.
+        assert_eq!(detect_tables(&mixed, 8.0, false).len(), 1);
+    }
+
     #[test]
     fn script_attachment_detects_subscript_after_body_text() {
         let body = make_item("log", 100.0, 500.0, 10.0, 15.0);
