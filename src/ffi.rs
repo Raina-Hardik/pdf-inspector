@@ -239,7 +239,11 @@ pub extern "C" fn ffi_process_pdf(
                     match profile.as_str() {
                         "compact" => opts.markdown.profile = MarkdownProfile::Compact,
                         "fidelity" => opts.markdown.profile = MarkdownProfile::Fidelity,
-                        _ => return return_error("Invalid markdown profile: expected 'fidelity' or 'compact'"),
+                        _ => {
+                            return return_error(
+                                "Invalid markdown profile: expected 'fidelity' or 'compact'",
+                            )
+                        }
                     }
                 }
                 if let Some(inc) = parsed.include_page_markers {

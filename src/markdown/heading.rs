@@ -62,7 +62,7 @@ fn dominant_font(line: &TextLine) -> Option<String> {
 /// whole heading even though the title itself has the document's heading
 /// size. Character weighting makes the longer title win while preserving the
 /// exact size for ordinary one-item lines.
-fn dominant_font_size(line: &TextLine) -> Option<f32> {
+pub(super) fn dominant_font_size(line: &TextLine) -> Option<f32> {
     let mut weights: HashMap<i32, usize> = HashMap::new();
     for item in &line.items {
         let bucket = (item.font_size * 10.0).round() as i32;
@@ -127,7 +127,9 @@ fn visual_style(line: &TextLine) -> Option<VisualStyle> {
     })
 }
 
-fn roman_value(token: &str) -> Option<u32> {
+/// Shared with `analysis::starts_with_numbering_prefix` so the veto
+/// exemption and the heading parser agree on what a roman numeral is.
+pub(super) fn roman_value(token: &str) -> Option<u32> {
     if token.is_empty() || token.len() > 8 {
         return None;
     }
@@ -515,14 +517,25 @@ mod tests {
                 width: text.len() as f32 * size * 0.45,
                 height: size,
                 font: font.into(),
+                font_tag: String::new(),
+                legacy_symbol_rewrite: false,
                 font_size: size,
                 page: 1,
                 is_bold: bold,
                 is_italic: false,
+                font_weight: None,
+                bold_source: bold.then_some(crate::types::BoldSource::FontName),
+                fixed_pitch: None,
+                fill_color: None,
+                stroke_color: None,
+                render_mode: None,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
+                baseline_shift: 0.0,
             }],
             y,
             page: 1,
@@ -673,14 +686,25 @@ mod tests {
             width: 38.0,
             height: 12.0,
             font: "Section".into(),
+            font_tag: String::new(),
+            legacy_symbol_rewrite: false,
             font_size: 12.0,
             page: 1,
             is_bold: true,
             is_italic: false,
+            font_weight: None,
+            bold_source: Some(crate::types::BoldSource::FontName),
+            fixed_pitch: None,
+            fill_color: None,
+            stroke_color: None,
+            render_mode: None,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
+            baseline_shift: 0.0,
         });
         let lines = vec![
             parent,
