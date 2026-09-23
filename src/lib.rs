@@ -749,24 +749,57 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
             })
             .collect();
 
-        let base_font_size = {
-            let mut freq: HashMap<i32, usize> = HashMap::new();
-            for item in &page_items {
-                *freq.entry((item.font_size * 10.0) as i32).or_default() += 1;
-            }
-            freq.into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(size, _)| size as f32 / 10.0)
-                .unwrap_or(12.0)
-        };
+        // Image placeholders ("[Image: X]") and link annotations are
+        // synthesized markers, not page text. The markdown pipeline splits
+        // them off before ANY detector runs (`markdown/mod.rs`, the
+        // `ItemType::Image` / `ItemType::Link` arms), and this dump must do
+        // the same: an image bbox manufactures a spurious column edge, and a
+        // link's URL lands verbatim inside a detected cell's text.
+        //
+        // `detector_map[i]` is the index in `page_items` of `detector_items[i]`,
+        // so every `item_indices` a detector returns can be translated back to
+        // the full list this page reports as `text_items`.
+        let (detector_items, detector_map): (Vec<TextItem>, Vec<usize>) = page_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                !matches!(
+                    item.item_type,
+                    extractor::ItemType::Image | extractor::ItemType::Link(_)
+                )
+            })
+            .map(|(idx, item)| (item.clone(), idx))
+            .unzip();
+
+        // Font statistics come from the same helper the markdown path uses.
+        // The ad-hoc frequency count this replaced had two defects: it counted
+        // Image/Link items (whose `font_size` is 0.0) toward the base, so an
+        // image-heavy page could report a base size of 0.0, and it broke ties
+        // via `HashMap` iteration order, making the heuristic tables a page
+        // reports differ between runs over identical bytes.
+        let base_font_size =
+            markdown::analysis::calculate_font_stats_from_items(&detector_items).most_common_size;
 
         let mut page_tables = Vec::new();
         // Indices (into `page_items`) already claimed by a structural
         // detector, so the heuristic pass cannot re-report the same table.
         let mut claimed: HashSet<usize> = HashSet::new();
 
-        let (rect_tables, _hints) =
-            tables::detect_tables_from_rects(&page_items, &page_rects, page);
+        // Translate a detector's `item_indices` (into `detector_items`) back
+        // to `page_items` positions.
+        let remap = |table: &mut tables::Table| {
+            for idx in &mut table.item_indices {
+                if let Some(&original) = detector_map.get(*idx) {
+                    *idx = original;
+                }
+            }
+        };
+
+        let (mut rect_tables, _hints) =
+            tables::detect_tables_from_rects(&detector_items, &page_rects, page);
+        for table in &mut rect_tables {
+            remap(table);
+        }
         // Line detection is skipped whenever the rect detector claimed
         // anything at all — not merely when it found a *data* table. That is
         // the markdown pipeline's own precedence: a rect-found TOC plus a
@@ -782,7 +815,11 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
         // are missed entirely by the rect detector, so fall through to the
         // line detector when rects found nothing.
         if !rects_claimed_something {
-            let line_tables = tables::detect_tables_from_lines(&page_items, &page_lines, page);
+            let mut line_tables =
+                tables::detect_tables_from_lines(&detector_items, &page_lines, page);
+            for table in &mut line_tables {
+                remap(table);
+            }
             for table in &line_tables {
                 claimed.extend(table.item_indices.iter().copied());
             }
@@ -790,20 +827,13 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
         }
 
         // Heuristic (text-density) detection, restricted to items no
-        // structural detector claimed. Image placeholders ("[Image: X]") and
-        // link items are excluded too: they are synthesized markers, not page
-        // text, and would otherwise land in cell content as literal strings.
-        let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = page_items
+        // structural detector claimed. Image/link items are already absent
+        // from `detector_items`.
+        let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = detector_items
             .iter()
-            .enumerate()
-            .filter(|(idx, item)| {
-                !claimed.contains(idx)
-                    && !matches!(
-                        item.item_type,
-                        extractor::ItemType::Image | extractor::ItemType::Link(_)
-                    )
-            })
-            .map(|(idx, item)| (item.clone(), idx))
+            .zip(detector_map.iter())
+            .filter(|(_, &original)| !claimed.contains(&original))
+            .map(|(item, &original)| (item.clone(), original))
             .unzip();
         if !unclaimed_items.is_empty() {
             let mut heuristic_tables =
