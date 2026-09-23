@@ -2019,7 +2019,17 @@ fn rect_span_counts(
 /// band's columns.
 ///
 /// **Subdivision.** The rect's own area must contain two or more vertically
-/// disjoint smaller rects. A band is painted BEHIND the table's per-cell
+/// disjoint smaller rects.
+///
+/// KNOWN LIMIT, measured: that second test is the same evidence the
+/// contained-sub-rect dedup in `detect_rects` destroys for any band under
+/// four cell-heights tall. So a band that is BOTH short enough for the dedup
+/// AND covers more than half the rows falls between the two: the row-count
+/// branch does not spare it, the content test passes, and the subdivision
+/// test fails only because its evidence was already deleted — so it still
+/// folds. `test_short_band_covering_most_rows_still_folds` reproduces it.
+/// Fixing the dedup widens this predicate's coverage on its own, with no
+/// change here. A band is painted BEHIND the table's per-cell
 /// rects, so those rects sit inside it; a genuine merged cell has no per-cell
 /// rects inside it, because being merged is precisely the absence of that
 /// subdivision. Content alone cannot separate the two — a block of several

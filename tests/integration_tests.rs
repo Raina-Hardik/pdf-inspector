@@ -11182,6 +11182,31 @@ fn test_short_bands_keep_their_per_cell_rects() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The GAP between the two blockers, measured. Blocker 1's fix needs the band
+// to contain vertically disjoint sub-rects -- and those are exactly what the
+// unfixed dedup deletes for bands under 4 cell-heights. So a band that is
+// short enough for the dedup AND covers more than half the rows falls between
+// the two: the row-count branch does not spare it, the content test passes,
+// and the subdivision test fails because its evidence was just removed.
+//
+// 5 rows, band over rows 0-2 (3 of 5, so more than half; 3 cell-heights, so
+// under the dedup's 4x gate). Columns 0 and 11 keep their own rects, so the
+// grid still has 5 rows -- this is blocker 1's corruption, not blocker 2's.
+//
+// Ignored, not deleted: it starts passing the moment the dedup stops
+// destroying the evidence, with no change to the predicate at all. That is
+// the concrete argument for fixing `:618` before widening anything here.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "gap between blockers 1 and 2: a band under 4 cell-heights covering more than half the rows still folds, because the unfixed dedup removes the sub-rect evidence blocker 1's fix depends on"]
+fn test_short_band_covering_most_rows_still_folds() {
+    let pdf = make_shaded_table_pdf(12, 5, &[(0, 2)], 1, 10);
+    let cells = shaded_table_cells(&pdf);
+    assert_cells_intact(&cells, 5, 12, "3-row band over 5 rows, cols 1-9");
+}
+
 /// The partial-width, 2-rows-tall shape in the wide table, recorded honestly:
 /// it is GREEN on the pre-fix code too, which is precisely why it is not the
 /// proof of anything. The columns outside the band (0, 10, 11) keep their own
