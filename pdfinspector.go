@@ -85,6 +85,119 @@ type PagesExtractionResult struct {
 	Error            string           `json:"error,omitempty"`
 }
 
+// TextItem is a single positioned text (or image/link/form-field) item on a page.
+type TextItem struct {
+	Text        string  `json:"text"`
+	X           float32 `json:"x"`
+	Y           float32 `json:"y"`
+	Width       float32 `json:"width"`
+	Height      float32 `json:"height"`
+	Font        string  `json:"font"`
+	FontSize    float32 `json:"fontSize"`
+	Page        uint32  `json:"page"`
+	IsBold      bool    `json:"isBold"`
+	IsItalic    bool    `json:"isItalic"`
+	IsUnderline bool    `json:"isUnderline"`
+	IsStrikeout bool    `json:"isStrikeout"`
+	// ItemType is one of "Text", "Image", "Link", "FormField".
+	ItemType string `json:"itemType"`
+	// LinkURL is the target URL for ItemType == "Link", empty otherwise.
+	LinkURL string `json:"linkUrl,omitempty"`
+	Mcid    *int64 `json:"mcid,omitempty"`
+	// Rotation is the item's baseline angle in degrees, in the same frame as
+	// its coordinates (see PageGeometry.Rotation). 0 for horizontal text and
+	// for non-text items (Image, Link, FormField), which carry no text matrix.
+	Rotation float32 `json:"rotation"`
+}
+
+// PdfLine is a line segment from a PDF path operator (m/l/S).
+type PdfLine struct {
+	X1   float32 `json:"x1"`
+	Y1   float32 `json:"y1"`
+	X2   float32 `json:"x2"`
+	Y2   float32 `json:"y2"`
+	Page uint32  `json:"page"`
+}
+
+// PdfRect is a rectangle from a PDF `re` operator (cell boundary, border, etc.).
+type PdfRect struct {
+	X      float32 `json:"x"`
+	Y      float32 `json:"y"`
+	Width  float32 `json:"width"`
+	Height float32 `json:"height"`
+	Page   uint32  `json:"page"`
+}
+
+// ImageInfo is an image XObject placeholder's position and identity on a page.
+type ImageInfo struct {
+	XObjectName string  `json:"xobjectName"`
+	X           float32 `json:"x"`
+	Y           float32 `json:"y"`
+	Width       float32 `json:"width"`
+	Height      float32 `json:"height"`
+	Page        uint32  `json:"page"`
+}
+
+// CellRect is the rect that geometrically covers a table cell.
+type CellRect struct {
+	X      float32 `json:"x"`
+	Y      float32 `json:"y"`
+	Width  float32 `json:"width"`
+	Height float32 `json:"height"`
+}
+
+// CellOccupancy is the per-cell occupancy signal for a Table, parallel to Table.Cells.
+type CellOccupancy struct {
+	// IsOwn is true when this cell's text is its own detected geometry
+	// (not folded in from a merged neighbor).
+	IsOwn bool `json:"isOwn"`
+	// Rect is the covering rect when known (own, or a merged neighbor's).
+	// Nil means no detector evidence is available either way.
+	Rect *CellRect `json:"rect,omitempty"`
+}
+
+// Table is a detected table on a page.
+type Table struct {
+	Columns []float32  `json:"columns"`
+	Rows    []float32  `json:"rows"`
+	Cells   [][]string `json:"cells"`
+	// Kind is one of "Data", "Toc".
+	Kind string `json:"kind"`
+	// Source is one of "Rects", "Lines", "Struct", "Heuristic" -- which
+	// detector produced this table -- or "Unspecified" when the producer
+	// recorded none.
+	Source string `json:"source"`
+	// CellOccupancy is nil when the detector that produced this table has
+	// no per-cell rect evidence to offer -- not "all cells empty". Only
+	// tables with Source == "Rects" populate this today.
+	CellOccupancy [][]CellOccupancy `json:"cellOccupancy,omitempty"`
+}
+
+// PageGeometry is the full raw layout geometry for one page: text items
+// (with rotation), line segments, rects, image placeholders, and detected
+// tables (with per-cell occupancy where available).
+type PageGeometry struct {
+	Page      uint32      `json:"page"`
+	TextItems []TextItem  `json:"textItems"`
+	Lines     []PdfLine   `json:"lines"`
+	Rects     []PdfRect   `json:"rects"`
+	Images    []ImageInfo `json:"images"`
+	Tables    []Table     `json:"tables"`
+	// Rotation is how this page's coordinate frame was turned so that
+	// predominantly rotated text reads left-to-right: "Upright", "Ccw" or
+	// "Cw". Every coordinate above, and every TextItem.Rotation, is ALREADY
+	// expressed in that turned frame -- this is reported so a consumer knows
+	// which frame it is reading, and must not be applied a second time.
+	Rotation string `json:"rotation"`
+	// PageBox is [x0, y0, x1, y1] of the visible page box
+	// (CropBox intersect MediaBox, else the MediaBox) in raw PDF user space:
+	// the box the coordinates above are relative to, with its lower-left
+	// corner as origin. Nil when the page declares no usable box, in which
+	// case the library falls back to US Letter. The page dictionary's
+	// /Rotate is NOT applied to any coordinate here.
+	PageBox *[4]float32 `json:"pageBox,omitempty"`
+}
+
 var (
 	compiledModule wazero.CompiledModule
 	wazeroRuntime  wazero.Runtime
@@ -368,6 +481,50 @@ func ExtractPagesMarkdownWithContext(ctx context.Context, pdfBytes []byte, pages
 	}
 
 	return &res, nil
+}
+
+// PageGeometryResult is the top-level (possibly-error) result of a
+// PageGeometry call: on success it's just the pages, but the WASM boundary
+// returns errors as a JSON object rather than an array, so this wrapper
+// exists only long enough to detect that shape before ExtractPageGeometry
+// returns the flat []PageGeometry callers actually want.
+type pageGeometryErrorWrapper struct {
+	Error string `json:"error"`
+}
+
+// ExtractPageGeometry extracts per-page raw layout geometry (text items with
+// rotation, line segments, rects, image placeholders, and detected tables)
+// from a PDF buffer. This is a read-only geometry dump, not the markdown
+// pipeline -- see PageGeometry's doc comment for what it does and does not
+// include.
+//
+// KNOWN LIMITATION: there is no password parameter, so an encrypted PDF
+// cannot be processed through this entry point (ProcessPdfWithOptions has
+// one). Plumbing it through is a deliberate follow-up, not an oversight.
+func ExtractPageGeometry(pdfBytes []byte) ([]PageGeometry, error) {
+	return ExtractPageGeometryWithContext(context.Background(), pdfBytes)
+}
+
+// ExtractPageGeometryWithContext extracts per-page raw layout geometry with a given context.
+func ExtractPageGeometryWithContext(ctx context.Context, pdfBytes []byte) ([]PageGeometry, error) {
+	out, err := invokeWasm(ctx, "ffi_page_geometry", pdfBytes, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// A failure serializes as a JSON object ({"error": "..."}), not the
+	// array PageGeometry success returns -- check that shape first.
+	var errWrapper pageGeometryErrorWrapper
+	if json.Unmarshal(out, &errWrapper) == nil && errWrapper.Error != "" {
+		return nil, errors.New(errWrapper.Error)
+	}
+
+	var pages []PageGeometry
+	if err := json.Unmarshal(out, &pages); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal PageGeometry: %w (output: %s)", err, string(out))
+	}
+
+	return pages, nil
 }
 
 // Version returns the version of the pdf-inspector library.

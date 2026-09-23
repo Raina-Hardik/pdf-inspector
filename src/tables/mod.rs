@@ -703,7 +703,13 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         multi_col_rows
     );
 
-    Some(Table::with_source(col_xs, row_ys, cells, item_indices, TableSource::Heuristic))
+    Some(Table::with_source(
+        col_xs,
+        row_ys,
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    ))
 }
 
 /// Build a region-scoped two-column key/value table from text baselines.

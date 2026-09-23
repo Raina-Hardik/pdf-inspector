@@ -1043,7 +1043,13 @@ fn build_open_edge_grid_table_for_rules(
     let mut rows = Vec::with_capacity(row_edges.len());
     rows.push(header_y);
     rows.extend_from_slice(&row_edges[..row_edges.len() - 1]);
-    Some(Table::with_source(col_edges, rows, cells, item_indices, TableSource::Lines))
+    Some(Table::with_source(
+        col_edges,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Lines,
+    ))
 }
 
 fn build_open_edge_grid_tables(

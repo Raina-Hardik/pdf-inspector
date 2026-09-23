@@ -1303,7 +1303,13 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     }
     number_x.sort_by(|a, b| a.total_cmp(b));
     let columns = vec![title_x, number_x[number_x.len() / 2]];
-    let table = Table::with_source(columns, rows[first..=last].to_vec(), cells, item_indices, TableSource::Heuristic);
+    let table = Table::with_source(
+        columns,
+        rows[first..=last].to_vec(),
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    );
     if table.kind != super::TableKind::Toc {
         debug!(
             "  contents list rejected: {} rows do not classify as a contents table",
@@ -1587,7 +1593,13 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
-    Some(Table::with_source(columns, rows, cells, item_indices, TableSource::Heuristic))
+    Some(Table::with_source(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    ))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table

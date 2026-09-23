@@ -1252,7 +1252,13 @@ fn detect_stacked_box_table(
     );
     let columns = vec![boxes[0].0 + boxes[0].2 / 2.0];
     let rows: Vec<f32> = boxes.iter().map(|b| b.1 + b.3 / 2.0).collect();
-    Some(Table::with_source(columns, rows, cells, item_indices, TableSource::Rects))
+    Some(Table::with_source(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
@@ -1566,7 +1572,7 @@ fn try_build_grid(
     // claiming `is_own = true` with no evidence behind the claim.
     let mut merge_coverage: Vec<Vec<Option<CellRect>>> = vec![vec![None; num_cols]; num_rows];
     let evidence_excluded =
-        non_merge_evidence_rects(group_rects, skip_rects, &col_edges, &row_edges);
+        non_merge_evidence_rects(group_rects, skip_rects, &col_edges, &row_edges, &cells);
     record_merge_coverage(
         &col_edges,
         &row_edges,
@@ -1986,21 +1992,34 @@ fn decorative_fill_rects(
 /// though each cell holds its own distinct text. A consumer filling down
 /// from the covering rect would then merge unrelated cells.
 ///
-/// So this mask additionally excludes any rect covering the grid's FULL
-/// width (every column), whatever its row count. Full width is the
-/// conservative line rather than `decorative_fill_rects`'s "strict
-/// majority": a colspan over a strict subset of columns is a plausible real
-/// merge and stays reportable, while a band spanning every column is table
-/// furniture. The failure direction is deliberate — a missed merge leaves a
-/// consumer reading each cell's own text, an invented merge makes it discard
-/// text that was really there.
+/// So this mask additionally excludes a rect that lies within ONE row, covers
+/// several columns, and has its own distinct text in more than one of the
+/// cells it covers. The cell contents are the discriminator, and they are a
+/// principled one: a merged cell holds one run of content — that is what
+/// being merged means — whereas a band painted behind a row sits over cells
+/// that each hold their own. A single-row colspan whose covered cells hold
+/// one run between them is still reported as the merge it is.
+///
+/// The test is applied only to purely horizontal spans. A multi-ROW span
+/// cannot use it: the sub-rows of a genuine rowspan routinely hold wrapped
+/// continuation lines of one logical value, which is exactly why
+/// `propagate_merged_cells` folds them together, so "more than one non-empty
+/// cell" does not mean "more than one value" there.
+///
+/// `cells` must be the grid as assigned, BEFORE any fold rewrites it.
+///
+/// The failure direction is deliberate: a missed merge leaves a consumer
+/// reading each cell's own text, an invented merge makes it discard text that
+/// was really there.
 fn non_merge_evidence_rects(
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
     col_edges: &[f32],
     row_edges: &[f32],
+    cells: &[Vec<String>],
 ) -> Vec<bool> {
     let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges.len().saturating_sub(1);
     let decorative = decorative_fill_rects(group_rects, skip_rects, col_edges, row_edges);
 
     group_rects
@@ -2010,8 +2029,30 @@ fn non_merge_evidence_rects(
             if decorative[idx] {
                 return true;
             }
-            let (cols_covered, _) = rect_span_counts(rect, col_edges, row_edges);
-            num_cols > 1 && cols_covered >= num_cols
+            let (rx, ry, rw, rh) = rect;
+            let rows: Vec<usize> = (0..num_rows)
+                .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
+                .collect();
+            if rows.len() != 1 {
+                return false;
+            }
+            let row = rows[0];
+            let cols: Vec<usize> = (0..num_cols)
+                .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
+                .collect();
+            if cols.len() < 2 {
+                return false;
+            }
+            let occupied = cols
+                .iter()
+                .filter(|&&c| {
+                    cells
+                        .get(row)
+                        .and_then(|r| r.get(c))
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .count();
+            occupied > 1
         })
         .collect()
 }
@@ -2422,7 +2463,13 @@ fn detect_row_stripe_table(
         content_ratio * 100.0
     );
 
-    Some(Table::with_source(column_centers, row_centers, cells, item_indices, TableSource::Rects))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Detect a grid that swallowed body text instead of tabular data.
@@ -3417,7 +3464,13 @@ fn detect_row_stripe_table_from_cell_rects(
         non_empty_cells as f32 / total_cells * 100.0
     );
 
-    Some(Table::with_source(column_centers, row_centers, cells, item_indices, TableSource::Rects))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Merge wrapped description-line bands back into their visual data rows.
@@ -3730,7 +3783,13 @@ fn detect_merged_cluster_table(
         content_ratio * 100.0
     );
 
-    Some(Table::with_source(column_centers, row_centers, cells, item_indices, TableSource::Rects))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Cluster text item X positions into column centers with a given minimum threshold.
@@ -6149,8 +6208,14 @@ mod tests {
             .cell_occupancy
             .as_ref()
             .expect("rect-detected grids carry per-cell occupancy");
-        assert!(!occupancy[1][0].is_own, "wide-table rowspan must be evidenced");
-        assert!(!occupancy[2][0].is_own, "wide-table rowspan must be evidenced");
+        assert!(
+            !occupancy[1][0].is_own,
+            "wide-table rowspan must be evidenced"
+        );
+        assert!(
+            !occupancy[2][0].is_own,
+            "wide-table rowspan must be evidenced"
+        );
         assert!(occupancy[1][1].is_own);
     }
 }

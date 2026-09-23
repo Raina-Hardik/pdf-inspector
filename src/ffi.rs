@@ -1,8 +1,11 @@
+use crate::tables::{CellOccupancy, CellRect, Table, TableKind, TableSource};
+use crate::types::{ItemType, PdfLine, PdfRect, TextItem};
 use crate::{
     classify_pdf_mem, extract_pages_markdown_mem,
     extractor::{extract_text_with_positions_mem, group_into_lines_preserving_all_text},
-    process_pdf_mem_with_options, LayoutComplexity, MarkdownProfile, PageMarkdown, PageOcrReasons,
-    PagesExtractionResult, PdfOptions, PdfProcessResult, PdfType, ProcessMode,
+    page_geometry_mem, process_pdf_mem_with_options, ImageInfo, LayoutComplexity, MarkdownProfile,
+    PageGeometry, PageMarkdown, PageOcrReasons, PageRotation, PagesExtractionResult, PdfOptions,
+    PdfProcessResult, PdfType, ProcessMode,
 };
 use serde::{Deserialize, Serialize};
 use std::alloc::{alloc as rust_alloc, dealloc as rust_dealloc, Layout};
@@ -399,6 +402,283 @@ pub extern "C" fn ffi_extract_pages_markdown(
                 }
             }
             Err(e) => return_error(&format!("Pages markdown extraction error: {e}")),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ffi_page_geometry
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiTextItem {
+    text: String,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    font: String,
+    font_size: f32,
+    page: u32,
+    is_bold: bool,
+    is_italic: bool,
+    is_underline: bool,
+    is_strikeout: bool,
+    item_type: &'static str,
+    /// The target URL for an `ItemType::Link(url)` item; `None` for every
+    /// other item type. `itemType` alone said only "Link" and dropped the
+    /// URL the enum variant was already carrying.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_url: Option<String>,
+    mcid: Option<i64>,
+    /// The item's baseline angle in degrees, in the same frame as its
+    /// coordinates (see `FfiPageGeometry::rotation`). 0 for horizontal text
+    /// and for non-text items, which carry no text matrix.
+    rotation: f32,
+}
+
+impl From<&TextItem> for FfiTextItem {
+    fn from(v: &TextItem) -> Self {
+        let item_type = match v.item_type {
+            ItemType::Text => "Text",
+            ItemType::Image => "Image",
+            ItemType::Link(_) => "Link",
+            ItemType::FormField => "FormField",
+        };
+        let link_url = match &v.item_type {
+            ItemType::Link(url) => Some(url.clone()),
+            _ => None,
+        };
+        Self {
+            text: v.text.clone(),
+            x: v.x,
+            y: v.y,
+            width: v.width,
+            height: v.height,
+            font: v.font.clone(),
+            font_size: v.font_size,
+            page: v.page,
+            is_bold: v.is_bold,
+            is_italic: v.is_italic,
+            is_underline: v.is_underline,
+            is_strikeout: v.is_strikeout,
+            item_type,
+            link_url,
+            mcid: v.mcid,
+            rotation: v.rotation,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiPdfLine {
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    page: u32,
+}
+
+impl From<&PdfLine> for FfiPdfLine {
+    fn from(v: &PdfLine) -> Self {
+        Self {
+            x1: v.x1,
+            y1: v.y1,
+            x2: v.x2,
+            y2: v.y2,
+            page: v.page,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiPdfRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    page: u32,
+}
+
+impl From<&PdfRect> for FfiPdfRect {
+    fn from(v: &PdfRect) -> Self {
+        Self {
+            x: v.x,
+            y: v.y,
+            width: v.width,
+            height: v.height,
+            page: v.page,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiImageInfo {
+    xobject_name: String,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    page: u32,
+}
+
+impl From<&ImageInfo> for FfiImageInfo {
+    fn from(v: &ImageInfo) -> Self {
+        Self {
+            xobject_name: v.xobject_name.clone(),
+            x: v.x,
+            y: v.y,
+            width: v.width,
+            height: v.height,
+            page: v.page,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiCellRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl From<&CellRect> for FfiCellRect {
+    fn from(v: &CellRect) -> Self {
+        Self {
+            x: v.x,
+            y: v.y,
+            width: v.width,
+            height: v.height,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiCellOccupancy {
+    is_own: bool,
+    rect: Option<FfiCellRect>,
+}
+
+impl From<&CellOccupancy> for FfiCellOccupancy {
+    fn from(v: &CellOccupancy) -> Self {
+        Self {
+            is_own: v.is_own,
+            rect: v.rect.as_ref().map(FfiCellRect::from),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiTable {
+    columns: Vec<f32>,
+    rows: Vec<f32>,
+    cells: Vec<Vec<String>>,
+    kind: &'static str,
+    source: &'static str,
+    /// `None` when the detector that produced this table has no per-cell
+    /// rect evidence to offer (see `Table::cell_occupancy`) — not "all cells
+    /// empty".
+    cell_occupancy: Option<Vec<Vec<FfiCellOccupancy>>>,
+}
+
+impl From<&Table> for FfiTable {
+    fn from(v: &Table) -> Self {
+        let kind = match v.kind {
+            TableKind::Data => "Data",
+            TableKind::Toc => "Toc",
+        };
+        let source = match v.source {
+            TableSource::Unspecified => "Unspecified",
+            TableSource::Lines => "Lines",
+            TableSource::Rects => "Rects",
+            TableSource::Struct => "Struct",
+            TableSource::Heuristic => "Heuristic",
+        };
+        Self {
+            columns: v.columns.clone(),
+            rows: v.rows.clone(),
+            cells: v.cells.clone(),
+            kind,
+            source,
+            cell_occupancy: v.cell_occupancy.as_ref().map(|rows| {
+                rows.iter()
+                    .map(|row| row.iter().map(FfiCellOccupancy::from).collect())
+                    .collect()
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FfiPageGeometry {
+    page: u32,
+    text_items: Vec<FfiTextItem>,
+    lines: Vec<FfiPdfLine>,
+    rects: Vec<FfiPdfRect>,
+    images: Vec<FfiImageInfo>,
+    tables: Vec<FfiTable>,
+    /// How this page's frame was turned so predominantly rotated text reads
+    /// left-to-right: "Upright", "Ccw" or "Cw" (see `PageGeometry::rotation`).
+    /// Every coordinate and every item `rotation` on this page is ALREADY in
+    /// the turned frame — a consumer must not apply this a second time.
+    rotation: &'static str,
+    /// `[x0, y0, x1, y1]` of the visible page box (`CropBox ∩ MediaBox`) in
+    /// raw PDF user space, the box these coordinates are relative to. Absent
+    /// when the page declares no usable box.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_box: Option<[f32; 4]>,
+}
+
+impl From<&PageGeometry> for FfiPageGeometry {
+    fn from(v: &PageGeometry) -> Self {
+        Self {
+            page: v.page,
+            text_items: v.text_items.iter().map(FfiTextItem::from).collect(),
+            lines: v.lines.iter().map(FfiPdfLine::from).collect(),
+            rects: v.rects.iter().map(FfiPdfRect::from).collect(),
+            images: v.images.iter().map(FfiImageInfo::from).collect(),
+            tables: v.tables.iter().map(FfiTable::from).collect(),
+            rotation: match v.rotation {
+                PageRotation::Upright => "Upright",
+                PageRotation::Ccw => "Ccw",
+                PageRotation::Cw => "Cw",
+            },
+            page_box: v.page_box.map(|(x0, y0, x1, y1)| [x0, y0, x1, y1]),
+        }
+    }
+}
+
+/// Per-page raw layout geometry: text items (with rotation), line segments,
+/// rects, image placeholders, and detected tables (with per-cell occupancy
+/// where the detector has real evidence — see `Table::cell_occupancy`).
+/// Additive: does not touch `ffi_process_pdf`'s markdown pipeline or output.
+#[no_mangle]
+pub extern "C" fn ffi_page_geometry(pdf_ptr: *const u8, pdf_len: usize) -> u64 {
+    catch_ffi(|| {
+        if pdf_ptr.is_null() || pdf_len == 0 {
+            return return_error("Empty or null PDF buffer");
+        }
+        let pdf_bytes = unsafe { slice::from_raw_parts(pdf_ptr, pdf_len) };
+
+        match page_geometry_mem(pdf_bytes) {
+            Ok(pages) => {
+                let ffi_pages: Vec<FfiPageGeometry> =
+                    pages.iter().map(FfiPageGeometry::from).collect();
+                match serde_json::to_string(&ffi_pages) {
+                    Ok(json) => return_string(json),
+                    Err(e) => return_error(&format!("Serialization error: {e}")),
+                }
+            }
+            Err(e) => return_error(&format!("Page geometry extraction error: {e}")),
         }
     })
 }
