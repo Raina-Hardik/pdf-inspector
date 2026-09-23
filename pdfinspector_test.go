@@ -247,8 +247,19 @@ func TestExtractPageGeometryTableCellOccupancy(t *testing.T) {
 		t.Fatalf("ExtractPageGeometry failed: %v", err)
 	}
 
+	// Counters, so the assertions below cannot pass vacuously: this test used
+	// to be satisfied by a run that detected no tables at all.
+	rectTablesWithOccupancy := 0
+	occupancyCells := 0
+
 	for _, page := range pages {
 		for _, table := range page.Tables {
+			if table.Source == "Rects" && table.CellOccupancy != nil {
+				rectTablesWithOccupancy++
+				for _, row := range table.CellOccupancy {
+					occupancyCells += len(row)
+				}
+			}
 			switch table.Source {
 			case "Rects", "Lines", "Struct", "Heuristic", "Unspecified":
 				// expected values
@@ -262,6 +273,14 @@ func TestExtractPageGeometryTableCellOccupancy(t *testing.T) {
 				t.Errorf("CellOccupancy row count %d must match Cells row count %d", len(table.CellOccupancy), len(table.Cells))
 			}
 		}
+	}
+
+	if rectTablesWithOccupancy == 0 {
+		t.Fatalf("fixture produced no rect-detected table carrying CellOccupancy — " +
+			"the assertions above never ran against real evidence")
+	}
+	if occupancyCells == 0 {
+		t.Fatalf("CellOccupancy grids were all empty across %d rect table(s)", rectTablesWithOccupancy)
 	}
 }
 

@@ -10412,9 +10412,8 @@ ET";
 
     // Columns 1 and 2 (D1/D2, E1/E2) were never part of a merge: ordinary
     // non-empty cells keep is_own=true with a single-slot synthesized rect.
-    for col in 1..=2 {
-        for row in 1..=2 {
-            let ordinary = &occ[row][col];
+    for (row, occ_row) in occ.iter().enumerate().take(3).skip(1) {
+        for (col, ordinary) in occ_row.iter().enumerate().take(3).skip(1) {
             assert!(
                 ordinary.is_own,
                 "row {} col{} is an ordinary unmerged cell and must report is_own=true",
@@ -10771,8 +10770,7 @@ fn test_page_geometry_mem_column_spanning_merge_reports_real_occupancy() {
     // own single-column slot. This is the assertion that fails pre-fix.
     let num_cols = table.cells[header_row].len();
     assert!(num_cols >= 3, "expected >= 3 columns, got {}", num_cols);
-    for c in 0..num_cols {
-        let cell = &occ[header_row][c];
+    for (c, cell) in occ[header_row].iter().enumerate().take(num_cols) {
         assert!(
             !cell.is_own,
             "header-band col {} spans multiple columns and must report is_own=false",
@@ -10963,5 +10961,469 @@ fn test_page_geometry_mem_real_document_shading_bands_are_not_merges() {
     assert!(
         checked_rows > 0,
         "fixture must exercise fully-covered rows, else the assertion never ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-4 review: Image/Link items must not reach ANY detector, and occupancy
+// must not contradict the cell text it is reported alongside.
+// ---------------------------------------------------------------------------
+
+/// A fully-ruled 4x4 `re`-rect table, with an image XObject drawn ABOVE it and
+/// emitted FIRST in the content stream, and optionally a Link annotation
+/// covering cell R1C1.
+///
+/// The placement is the whole point. The pre-existing fixture
+/// (`make_rect_table_with_image_placeholder_pdf`) draws its image BELOW the
+/// table and last in the stream, so the image placeholder sorts after every
+/// table item and dropping it inside the detector shifts nothing. Drawn
+/// above/first, the placeholder is item 0 and every text index the detector
+/// reports is off by one unless it is mapped back.
+fn make_ruled_table_pdf_with_image_above(link_url: Option<&str>) -> Vec<u8> {
+    const COLS: usize = 4;
+    const ROWS: usize = 4;
+    const COL_W: f32 = 90.0;
+    const ROW_H: f32 = 40.0;
+    const X0: f32 = 50.0;
+    const Y0: f32 = 400.0;
+
+    // Image first, and above the table in page space.
+    let mut content = String::from("q\n200 0 0 60 60 600 cm /Im0 Do\nQ\n");
+    content.push_str("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+            content.push_str(&format!("{} {} {} {} re f\n", x, y, COL_W, ROW_H));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W + 6.0;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H + 14.0;
+            content.push_str(&format!("1 0 0 1 {} {} Tm (R{}C{}) Tj\n", x, y, r, c));
+        }
+    }
+    content.push_str("ET");
+
+    // Annotation rect over cell R1C1.
+    let annots = link_url.map(|url| {
+        let x = X0 + COL_W;
+        let y = Y0 + (ROWS - 1 - 1) as f32 * ROW_H;
+        format!(
+            "/Annots [<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] \
+             /Border [0 0 0] /A << /S /URI /URI ({}) >> >>]",
+            x,
+            y,
+            x + COL_W,
+            y + ROW_H,
+            url
+        )
+    });
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", annots.as_deref())
+}
+
+fn make_pdf_with_image_xobject_and_annots(
+    content: &str,
+    media_box: &str,
+    annots: Option<&str>,
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        &format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+             /Contents 4 0 R {} >>",
+            annots.unwrap_or("")
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(&mut pdf, &mut offsets, 5, HELVETICA_FONT);
+    let image_data = vec![0u8; 100];
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n");
+    pdf.extend_from_slice(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width 10 /Height 10 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+            image_data.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&image_data);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_offset
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_page_geometry_mem_image_above_table_keeps_item_indices_aligned() {
+    // Blocker A. `page_geometry_mem` handed its FULL item list to
+    // `detect_tables_from_rects`, which drops image placeholders internally
+    // without mapping the surviving indices back. With the image drawn above
+    // the table it is item 0, so every index the table reported pointed one
+    // item to the left of the text it meant — and the last cell was left
+    // unclaimed, free to be detected a second time by the heuristic pass.
+    let pdf = make_ruled_table_pdf_with_image_above(None);
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely place the image first, else this proves nothing.
+    assert!(
+        pg.text_items[0].text.starts_with("[Image:"),
+        "fixture must emit the image placeholder as item 0; got {:?}",
+        pg.text_items[0].text
+    );
+
+    let rect_tables: Vec<_> = pg
+        .tables
+        .iter()
+        .filter(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .collect();
+    assert_eq!(
+        rect_tables.len(),
+        1,
+        "fixture must produce exactly one rect-detected table"
+    );
+    let table = rect_tables[0];
+
+    // Every reported index must name a real table text item, and the set must
+    // cover all 16 cells.
+    let mut named: Vec<String> = Vec::new();
+    for &idx in &table.item_indices {
+        let item = &pg.text_items[idx];
+        assert!(
+            !item.text.starts_with("[Image:"),
+            "item_indices points at the image placeholder (index {idx}) — \
+             the detector's internal image drop was never mapped back"
+        );
+        named.push(item.text.clone());
+    }
+    named.sort();
+    let mut expected: Vec<String> = (0..4)
+        .flat_map(|r| (0..4).map(move |c| format!("R{r}C{c}")))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        named, expected,
+        "the table's item_indices must name exactly its own 16 cell items"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_link_url_never_enters_a_rect_table_cell() {
+    // Blocker A, second half. Link items were filtered for the heuristic pass
+    // only, so a link annotation over a cell came back concatenated into that
+    // cell's text in a rect-detected table.
+    const URL: &str = "https://example.com/docs";
+    let pdf = make_ruled_table_pdf_with_image_above(Some(URL));
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely produce a link item over the cell.
+    assert!(
+        pg.text_items.iter().any(|i| i.text == URL),
+        "fixture must emit a link item carrying the URL"
+    );
+    assert!(
+        !pg.tables.is_empty(),
+        "fixture must produce at least one table"
+    );
+
+    for table in &pg.tables {
+        for row in &table.cells {
+            for cell in row {
+                assert!(
+                    !cell.contains("example.com"),
+                    "link URL leaked into a {:?} table cell: {:?}",
+                    table.source,
+                    cell
+                );
+            }
+        }
+    }
+}
+
+/// A 4-column x 12-row ruled table with a full-width decorative band painted
+/// over the top FOUR rows — the blocker-B repro.
+///
+/// Two of the dimensions are load-bearing and were found the hard way. The
+/// band must be at least 4x the height of a cell rect, or
+/// `detect_tables_from_rects`'s contained-sub-rect dedup deletes the covered
+/// cells as cell-internal decoration; the row boundary between them then
+/// never becomes a grid edge, the grid comes back one row short, and the
+/// concatenated text is a property of item assignment rather than of the
+/// fold, which is a different (and honest) situation. And the band must span
+/// at most half the grid's rows, or `decorative_fill_rects` stops calling it
+/// decoration and the two paths happen to agree by luck rather than by
+/// construction.
+fn make_banded_table_pdf() -> Vec<u8> {
+    const COLS: usize = 4;
+    const ROWS: usize = 12;
+    const BAND_ROWS: usize = 4;
+    const COL_W: f32 = 90.0;
+    const ROW_H: f32 = 30.0;
+    const X0: f32 = 50.0;
+    const Y0: f32 = 200.0;
+    let row_y = |r: usize| Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+
+    let mut content = String::from("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "{} {} {} {} re f\n",
+                X0 + c as f32 * COL_W,
+                row_y(r),
+                COL_W,
+                ROW_H
+            ));
+        }
+    }
+    // The band: full table width, over the top `BAND_ROWS` rows.
+    content.push_str(&format!(
+        "0.8 0.8 0.8 rg\n{} {} {} {} re f\n",
+        X0,
+        row_y(BAND_ROWS - 1),
+        COL_W * COLS as f32,
+        ROW_H * BAND_ROWS as f32
+    ));
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (r{}c{}) Tj\n",
+                X0 + c as f32 * COL_W + 6.0,
+                row_y(r) + 10.0,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+#[test]
+fn test_page_geometry_mem_occupancy_never_contradicts_cell_text() {
+    // Blocker B. Occupancy was computed from `non_merge_evidence_rects` while
+    // the text fold ran off `skip_rects` alone, so the two could reach
+    // opposite conclusions about the same rect: the band below folded rows 0
+    // and 1 into `"r0c0 r1c0"` while occupancy reported `is_own = true` with a
+    // one-slot rect for the very cell whose text had just been moved.
+    //
+    // The assertion is the AGREEMENT, not either outcome. Which way a given
+    // rect is decided is the fold policy's business (and PR #2 changes it);
+    // that occupancy reports what the fold actually did is this PR's.
+    let pdf = make_banded_table_pdf();
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    let table = pg
+        .tables
+        .iter()
+        .find(|t| {
+            matches!(t.source, pdf_inspector::tables::TableSource::Rects)
+                && t.cell_occupancy.is_some()
+        })
+        .expect("fixture must produce a rect-detected table carrying occupancy");
+    let occupancy = table.cell_occupancy.as_ref().unwrap();
+    assert!(
+        table.cells.len() >= 3 && table.cells[0].len() >= 2,
+        "fixture must produce a multi-row, multi-column grid; got {}x{}",
+        table.cells.len(),
+        table.cells.first().map_or(0, |r| r.len())
+    );
+
+    // A cell that was folded INTO another cell is emptied by the fold. Any
+    // cell reported as `is_own` while its column's text was consolidated
+    // elsewhere is the contradiction this test exists for. Detect a fold
+    // structurally: a cell holding two of the fixture's distinct labels.
+    let mut checked = 0;
+    for (r, row) in table.cells.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            let labels = cell
+                .split_whitespace()
+                .filter(|t| t.starts_with('r'))
+                .count();
+            if labels <= 1 {
+                continue;
+            }
+            checked += 1;
+            // This cell absorbed another row's text, so the position is NOT
+            // its own one-slot cell and occupancy must say so.
+            assert!(
+                !occupancy[r][c].is_own,
+                "cell ({r},{c}) holds folded text {:?} but occupancy claims \
+                 is_own = true — the two disagree about the same rect",
+                cell
+            );
+            let rect = occupancy[r][c].rect.expect("covering rect is reported");
+            assert!(
+                rect.height > (table.rows[0] - table.rows[1]).abs(),
+                "the reported covering rect must be the multi-row merge geometry"
+            );
+        }
+    }
+    // If nothing folded, the contradiction direction is the other one — no
+    // cell anywhere may claim a merge it cannot show.
+    if checked == 0 {
+        for (r, row) in occupancy.iter().enumerate() {
+            for (c, occ) in row.iter().enumerate() {
+                assert!(
+                    occ.is_own,
+                    "nothing was folded, yet cell ({r},{c}) reports a merge"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_is_deterministic_and_ignores_image_font_size() {
+    // Blocker C. `base_font_size` was an ad-hoc frequency count over ALL
+    // items — image placeholders and link items included, whose font_size is
+    // 0.0 — with ties broken by `HashMap` iteration order, so the same bytes
+    // could yield different heuristic tables between runs in one process.
+    let pdf = make_ruled_table_pdf_with_image_above(Some("https://example.com/docs"));
+
+    let render = |pages: &[pdf_inspector::PageGeometry]| -> String {
+        pages
+            .iter()
+            .map(|p| {
+                p.tables
+                    .iter()
+                    .map(|t| format!("{:?}{:?}{:?}", t.source, t.item_indices, t.cells))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("#")
+    };
+
+    let first = render(&page_geometry_mem(&pdf).expect("extraction should succeed"));
+    for run in 1..8 {
+        let again = render(&page_geometry_mem(&pdf).expect("extraction should succeed"));
+        assert_eq!(again, first, "geometry output differed on run {run}");
+    }
+    assert!(!first.is_empty(), "fixture must detect at least one table");
+}
+
+/// A text-only (no `re` rects) 3x4 grid that only the heuristic text-density
+/// detector can find, on a page carrying `image_count` image placeholders.
+fn make_heuristic_table_pdf_with_images(image_count: usize) -> Vec<u8> {
+    const COLS: usize = 3;
+    const ROWS: usize = 4;
+    const COL_W: f32 = 120.0;
+    const ROW_H: f32 = 20.0;
+    const X0: f32 = 60.0;
+    const Y0: f32 = 500.0;
+
+    let mut content = String::new();
+    for i in 0..image_count {
+        content.push_str(&format!(
+            "q\n40 0 0 20 {} {} cm /Im0 Do\nQ\n",
+            60.0 + (i % 8) as f32 * 45.0,
+            660.0 + (i / 8) as f32 * 25.0
+        ));
+    }
+    content.push_str("BT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
+                X0 + c as f32 * COL_W,
+                Y0 - r as f32 * ROW_H,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+#[test]
+fn test_page_geometry_mem_base_font_size_ignores_image_placeholders() {
+    // Blocker C, the half that changes an answer rather than only stabilising
+    // it. `base_font_size` counted image and link items, whose `font_size` is
+    // 0.0, so on an image-heavy page the most common "size" was 0.0 and every
+    // font-size-relative threshold in the heuristic detector collapsed.
+    //
+    // Same text, twice: once on a page with no images and once on a page
+    // whose images outnumber its text items. The base size is a property of
+    // the TEXT, so the tables must be identical.
+    let without_images = page_geometry_mem(&make_heuristic_table_pdf_with_images(0))
+        .expect("extraction should succeed");
+    let with_images = page_geometry_mem(&make_heuristic_table_pdf_with_images(20))
+        .expect("extraction should succeed");
+
+    // The fixture must genuinely be image-dominated, else it proves nothing.
+    assert!(
+        with_images[0].images.len() > without_images[0].text_items.len(),
+        "fixture must be image-dominated: {} images vs {} text items",
+        with_images[0].images.len(),
+        without_images[0].text_items.len()
+    );
+
+    let cells = |pages: &[pdf_inspector::PageGeometry]| -> Vec<Vec<Vec<String>>> {
+        pages[0].tables.iter().map(|t| t.cells.clone()).collect()
+    };
+    assert!(
+        !cells(&without_images).is_empty(),
+        "fixture must detect a table when no images are present"
+    );
+    assert_eq!(
+        cells(&with_images),
+        cells(&without_images),
+        "adding image placeholders changed the detected tables — they are \
+         being counted toward the base font size"
     );
 }

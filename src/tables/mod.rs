@@ -216,7 +216,11 @@ pub(crate) fn try_build_rect_guided_table(
         row_boundaries,
         cells,
         used_indices,
-        TableSource::Heuristic,
+        // `Rects`, not `Heuristic`: the column boundaries above come from the
+        // cluster's real `re` rect X positions. Only the row boundaries are
+        // text-derived, and a table whose columns are vector geometry is not
+        // a text-density detection.
+        TableSource::Rects,
     ))
 }
 

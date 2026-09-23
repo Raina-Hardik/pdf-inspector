@@ -483,7 +483,7 @@ func ExtractPagesMarkdownWithContext(ctx context.Context, pdfBytes []byte, pages
 	return &res, nil
 }
 
-// PageGeometryResult is the top-level (possibly-error) result of a
+// pageGeometryErrorWrapper is the top-level (possibly-error) result of a
 // PageGeometry call: on success it's just the pages, but the WASM boundary
 // returns errors as a JSON object rather than an array, so this wrapper
 // exists only long enough to detect that shape before ExtractPageGeometry
