@@ -11,7 +11,7 @@ use log::debug;
 use crate::structure_tree::{StructTable, StructTableRow};
 use crate::types::TextItem;
 
-use super::Table;
+use super::{Table, TableSource};
 
 #[derive(Debug, Clone)]
 struct MatchedCell {
@@ -534,11 +534,12 @@ pub fn detect_tables_from_struct_tree(
             left_align_struct_rows(&raw_rows, num_cols);
         legacy_item_indices.sort_unstable();
         legacy_item_indices.dedup();
-        let legacy_table = Table::new(
+        let legacy_table = Table::with_source(
             fallback_col_positions.clone(),
             legacy_row_positions,
             legacy_cells,
             legacy_item_indices,
+            TableSource::Struct,
         );
 
         let col_positions = infer_column_positions(&raw_rows, &fallback_col_positions, num_cols);
@@ -547,11 +548,12 @@ pub fn detect_tables_from_struct_tree(
         aligned_item_indices.sort_unstable();
         aligned_item_indices.dedup();
 
-        let mut aligned_table = Table::new(
+        let mut aligned_table = Table::with_source(
             col_positions,
             aligned_row_positions,
             aligned_cells,
             aligned_item_indices,
+            TableSource::Struct,
         );
         let item_count_before_header = aligned_table.item_indices.len();
         let row_count_before_header = aligned_table.cells.len();
