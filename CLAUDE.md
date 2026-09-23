@@ -77,5 +77,5 @@ RUST_LOG=pdf_inspector::detector=debug cargo run --release --bin detect-pdf -- f
 
 - Clippy: use `is_some_and(...)` not `map_or(false, ...)`
 - lopdf quirk: `ParseError` is private — match by string for `InvalidFileHeader`
-- Column limit for tables: 25 (wide statistical tables)
-- `propagate_merged_cells` skipped for >10 columns (spanning rects = background fills)
+- Column limit for tables: 40 (`MAX_TABLE_COLUMNS` in `tables/mod.rs`, single-sourced across all three detectors)
+- `propagate_merged_cells` gates on the `decorative_fill_rects` geometry predicate (spanning rects = background fills), not on column count

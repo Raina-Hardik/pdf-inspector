@@ -11047,12 +11047,6 @@ fn test_wide_table_with_full_width_shading_keeps_every_row() {
     // tables need merge propagation too.
     let pdf = make_wide_shaded_table_pdf();
     let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
-    eprintln!("INSTRRECTS n={}", pages[0].rects.len());
-    for r in &pages[0].rects {
-        if r.width > 200.0 {
-            eprintln!("INSTRWIDE {:?}", (r.x, r.y, r.width, r.height));
-        }
-    }
     let table = pages[0]
         .tables
         .iter()
