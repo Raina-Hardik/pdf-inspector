@@ -11614,17 +11614,147 @@ fn make_small_type_key_value_pdf(label_pt: f32, value_pt: f32) -> Vec<u8> {
     make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
 }
 
+/// A small-type (7pt label / 6pt value) key/value table with an ordinary
+/// small-type PROSE paragraph above it on the SAME page — the shape that
+/// stresses `detect_small_type_tables` differently from
+/// `make_small_type_key_value_pdf`: the page is no longer table-only, so a
+/// candidate base that is too permissive could pull prose lines into a
+/// table region (`has_table_like_content`'s row-gap grouping does not know
+/// "prose" from "table" except by shape), and a base that is too strict
+/// could still lose the table's own minority size the same way the
+/// label/value fixture above does. Both the table's completeness AND the
+/// prose's exclusion from every cell are asserted.
+fn make_small_type_table_with_prose_pdf(label_pt: f32, value_pt: f32) -> Vec<u8> {
+    const PROSE_X: f32 = 60.0;
+    const PROSE_ROW_H: f32 = 11.0;
+    const PROSE_Y0: f32 = 700.0;
+    const PROSE_FONT: f32 = 7.0;
+    const PROSE_LINES: [&str; 6] = [
+        "This section summarizes quarterly results for the reporting",
+        "period, covering revenue recognition, cost allocation, and",
+        "the resulting margin trends across each business segment for",
+        "the fiscal year, with commentary on the drivers behind the",
+        "period-over-period movement observed in the table that",
+        "follows immediately below this paragraph.",
+    ];
+
+    const COL_X: [f32; 4] = [60.0, 220.0, 340.0, 460.0];
+    const ROW_H: f32 = 20.0;
+    const TABLE_Y0: f32 = 500.0;
+
+    let labels = ["Revenue", "Cost of sales", "Gross margin", "Net income"];
+    let values = [
+        ["12,481", "11,904", "10,552"],
+        ["9,033", "8,771", "8,140"],
+        ["3,448", "3,133", "2,412"],
+        ["1,207", "1,014", "876"],
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n");
+    content.push_str(&format!("/F1 {PROSE_FONT} Tf\n"));
+    for (i, line) in PROSE_LINES.iter().enumerate() {
+        let y = PROSE_Y0 - i as f32 * PROSE_ROW_H;
+        content.push_str(&format!("1 0 0 1 {PROSE_X} {y} Tm ({line}) Tj\n"));
+    }
+    for (r, label) in labels.iter().enumerate() {
+        let y = TABLE_Y0 - r as f32 * ROW_H;
+        content.push_str(&format!(
+            "/F1 {label_pt} Tf\n1 0 0 1 {} {y} Tm ({label}) Tj\n",
+            COL_X[0]
+        ));
+        for (c, value) in values[r].iter().enumerate() {
+            content.push_str(&format!(
+                "/F1 {value_pt} Tf\n1 0 0 1 {} {y} Tm ({value}) Tj\n",
+                COL_X[c + 1]
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// A uniform 7pt, 3x3 numeric table whose rows are spaced 35pt apart — wider
+/// than pass 1's fixed 30pt row-gap threshold (`find_table_regions`), so at
+/// the OLD fixed-12.0 fallback this page finds NO table at all (not just an
+/// incomplete one): pass 1 splits every row into its own undersized region,
+/// and 12.0 never reaches pass 2's adaptive median-gap×3 grouping
+/// (`find_table_regions_strict`), which handles this spacing correctly.
+fn make_wide_row_spacing_small_type_pdf() -> Vec<u8> {
+    const COL_X: [f32; 3] = [60.0, 200.0, 340.0];
+    const ROW_H: f32 = 35.0;
+    const Y0: f32 = 600.0;
+
+    let mut content = String::new();
+    content.push_str("BT\n/F1 7 Tf\n");
+    for r in 0..3usize {
+        let y = Y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let value = 100 + r * 37 + c * 11;
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({value}) Tj\n"));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// End-to-end guard, through the whole `page_geometry_mem` path, that
+/// disabling the small-type fix entirely is detectable: at the OLD
+/// fixed-12.0 fallback this fixture finds ZERO tables, not merely an
+/// incomplete one (pass 1's fixed 30pt row-gap threshold splits every 35pt
+/// -spaced row into its own undersized region), so if a future edit routes
+/// small-type pages back through `page_geometry_mem`'s non-small-type branch
+/// (a bare `detect_tables(&unclaimed_items, base_font_size, false)` call)
+/// this test fails outright rather than merely losing a few cells.
+///
+/// Verified by mutation: temporarily forcing `page_geometry_mem` to always
+/// take its non-small-type branch (`is_small_type_page` short-circuited to
+/// `false`) makes this test fail (0 tables found). This mutation is NOT
+/// caught by `test_page_geometry_mem_finds_a_small_type_table` below —
+/// its 8pt/7pt fixture already found a (correct) result at the old fixed
+/// 12.0 fallback too, so that test alone cannot tell "the fix is disabled"
+/// from "the fix is working"; this fixture's whole point is a shape 12.0
+/// finds nothing on at all.
+#[test]
+fn test_page_geometry_mem_small_type_wide_row_spacing_needs_the_fix() {
+    let pages = page_geometry_mem(&make_wide_row_spacing_small_type_pdf())
+        .expect("extraction should succeed");
+    let tables = &pages[0].tables;
+    assert!(
+        !tables.is_empty(),
+        "a 7pt table with 35pt row spacing must be found through the whole \
+         page_geometry_mem path — if this now returns zero tables, the \
+         small-type fix has regressed to the old fixed-12.0-only behavior"
+    );
+    let non_empty_cells: usize = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    assert_eq!(
+        non_empty_cells, 9,
+        "all 9 cells of the 3x3 grid must survive, got {tables:?}"
+    );
+}
+
 #[test]
 fn test_page_geometry_mem_finds_a_small_type_table() {
-    // End-to-end guard for the small-type case. `base_font_size` comes from
-    // `calculate_font_stats_from_items`, which ignores sizes under 9pt and
-    // answers 12.0 when nothing clears that floor — so a page set entirely in
-    // 7-8pt (financial and statistical tables, routinely) is detected with a
-    // base no item on the page matches. That is not a hole: 12.0 routes every
-    // such item into the lenient small-font pass, which is exactly where they
-    // belong. `small_type_grid_needs_the_permissive_base_not_the_page_mode`
-    // in `tables::detect_heuristic` pins the arithmetic; this test pins the
-    // observable outcome through the whole geometry path.
+    // End-to-end guard for the small-type case. `calculate_font_stats_from_items`
+    // ignores sizes under 9pt and answers 12.0 when nothing clears that
+    // floor — so a page set entirely in 7-8pt (financial and statistical
+    // tables, routinely) is detected with a base no item on the page
+    // matches. `page_geometry_mem` routes such a page through
+    // `tables::detect_small_type_tables` instead (`lib.rs`), which tries
+    // several page-derived candidate bases and keeps whichever recovers the
+    // most source items — specifically so a MIXED-size table (e.g. these
+    // 8pt labels beside 7pt values) does not lose a whole column to
+    // whichever pass its minority size falls outside of.
+    // `mixed_label_value_size_sweep_measures_completeness` and
+    // `mixed_size_repro_cases_from_round_4_review` in
+    // `tables::detect_heuristic` pin the arithmetic across many mixed-size
+    // configurations; this test pins the observable outcome through the
+    // whole geometry path, including that EVERY cell survives, not just
+    // that a table is found.
     let small = page_geometry_mem(&make_small_type_key_value_pdf(8.0, 7.0))
         .expect("extraction should succeed");
     let cells = |pages: &[pdf_inspector::PageGeometry]| -> Vec<Vec<Vec<String>>> {
@@ -11641,6 +11771,34 @@ fn test_page_geometry_mem_finds_a_small_type_table() {
             .any(|t| t.iter().flatten().any(|c| c.contains("12,481"))),
         "the detected table must be the small-type grid, got {small_cells:?}"
     );
+    // COMPLETENESS, not just presence: this fixture's labels (8pt) and
+    // values (7pt) are different sizes, exactly the case a most-common-size
+    // base drops the less-common size from. A prior round of this fix
+    // returned the value columns while silently losing the entire label
+    // column — worse than not finding the table, since the caller has no
+    // way to tell the result is incomplete. Every label and every value
+    // must survive.
+    let flat: Vec<&str> = small_cells
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|s| s.as_str())
+        .collect();
+    for label in ["Revenue", "Cost of sales", "Gross margin", "Net income"] {
+        assert!(
+            flat.iter().any(|c| c.contains(label)),
+            "label {label:?} must survive the 8pt/7pt mixed-size table, got {small_cells:?}"
+        );
+    }
+    for value in [
+        "12,481", "11,904", "10,552", "9,033", "8,771", "8,140", "3,448", "3,133", "2,412",
+        "1,207", "1,014", "876",
+    ] {
+        assert!(
+            flat.iter().any(|c| c.contains(value)),
+            "value {value:?} must survive the 8pt/7pt mixed-size table, got {small_cells:?}"
+        );
+    }
 
     // The common case is unchanged: the same table at body size is found too,
     // and the small-type page finds the same shape.
@@ -11694,5 +11852,88 @@ fn test_page_geometry_mem_base_font_size_ignores_image_placeholders() {
         cells(&without_images),
         "adding image placeholders changed the detected tables — they are \
          being counted toward the base font size"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_small_type_table_with_prose_on_same_page() {
+    // End-to-end guard combining two things the sweeps in
+    // `tables::detect_heuristic` cover separately: a mixed-size (8pt
+    // label / 7pt value) small-type table, AND ordinary small-type prose
+    // sharing the page with it. Two failure modes are checked at once:
+    //
+    // 1. Completeness must not regress vs. the OLD fixed-12.0 fallback —
+    //    every label and every value cell must survive, same as the
+    //    prose-free fixture above.
+    // 2. PRECISION: no word of the prose paragraph may appear inside any
+    //    detected table cell. A candidate base permissive enough to rescue
+    //    a table's minority font size is also more permissive about what
+    //    counts as a table row in the first place, so this is not implied
+    //    by (1) — a base could recover every table cell AND additionally
+    //    pull prose lines into a spurious row.
+    let pdf = make_small_type_table_with_prose_pdf(8.0, 7.0);
+    let pages = page_geometry_mem(&pdf).expect("extraction should succeed");
+    let tables = &pages[0].tables;
+
+    assert!(
+        !tables.is_empty(),
+        "the small-type table must still be found with prose on the same page"
+    );
+
+    let flat: Vec<&str> = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .map(|s| s.as_str())
+        .collect();
+
+    // Completeness: every label and every value cell survives, same set as
+    // `test_page_geometry_mem_finds_a_small_type_table`'s prose-free case.
+    for label in ["Revenue", "Cost of sales", "Gross margin", "Net income"] {
+        assert!(
+            flat.iter().any(|c| c.contains(label)),
+            "label {label:?} must survive with prose on the same page, got {tables:?}"
+        );
+    }
+    for value in [
+        "12,481", "11,904", "10,552", "9,033", "8,771", "8,140", "3,448", "3,133", "2,412",
+        "1,207", "1,014", "876",
+    ] {
+        assert!(
+            flat.iter().any(|c| c.contains(value)),
+            "value {value:?} must survive with prose on the same page, got {tables:?}"
+        );
+    }
+
+    // Precision: none of the prose paragraph's distinctive words leak into
+    // any table cell. Words chosen to be unique to the prose (not
+    // substrings of any label/value text above).
+    for word in [
+        "summarizes",
+        "quarterly",
+        "recognition",
+        "allocation",
+        "segments",
+        "commentary",
+        "period-over-period",
+        "paragraph",
+    ] {
+        assert!(
+            flat.iter().all(|c| !c.contains(word)),
+            "prose word {word:?} leaked into a detected table cell, got {tables:?}"
+        );
+    }
+
+    // Non-empty cell count is exactly the table's 16 (4 rows x 4 cols) —
+    // if it is higher, prose lines were folded into the table as extra
+    // rows/cells even though no single prose word tripped the substring
+    // check above (e.g. two prose words concatenated into one cell).
+    let non_empty_cells: usize = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    assert_eq!(
+        non_empty_cells, 16,
+        "expected exactly the 4x4 table's 16 non-empty cells, got {tables:?}"
     );
 }

@@ -650,6 +650,75 @@ pub struct PageGeometry {
     pub page_box: Option<(f32, f32, f32, f32)>,
 }
 
+/// Candidate base font sizes for an all-small-type page: everything on the
+/// page is below `calculate_font_stats_from_items`'s 9pt counting floor, so
+/// that helper has nothing to average and reports its own fixed 12.0
+/// fallback — a real regression for such pages (see
+/// `detect_small_type_tables`'s doc comment for why a single guessed base
+/// cannot be trusted, whichever formula produces it).
+///
+/// This returns a short, deterministically-ordered list of bases for
+/// `detect_small_type_tables` to try, not a single answer:
+///
+/// 1. **A pass-2-only base**, when the page's size spread allows one. Pass 1
+///    (small-font, `detect_heuristic.rs`) admits `size <= base * 0.90` and
+///    runs FIRST, claiming whatever it finds before pass 2 (body-font,
+///    `base * 0.85 <= size <= base * 1.05`) ever sees it — so "both sizes
+///    fit inside pass 2's band" is not enough; pass 1 must be unable to
+///    claim EITHER size first, i.e. `min_size > base * 0.90`, or a
+///    mixed-size table gets split across passes and one side of it loses
+///    the 6-item minimum for its own pass. Combined with `max_size <=
+///    base * 1.05`, this is feasible only when the page's size spread is
+///    inside pass 2's own tolerance: `max_size / min_size < 1.05 / 0.90 ≈
+///    1.167`. Outside that ratio there is no base that keeps a mixed-size
+///    table together in pass 2 alone, and this candidate is omitted rather
+///    than returned anyway and silently losing data.
+/// 2. **The old fixed 12.0.** `12.0 * 0.90 = 10.8` sits above any
+///    all-small-type page's max size by construction (this function is
+///    only ever called for a page where nothing reaches 9pt), so 12.0 always
+///    puts the WHOLE page through pass 1 together — the same guarantee the
+///    original fixed fallback gave, and never worse than what it already
+///    achieved.
+/// 3. **A page-derived pass-1-only base** (`max_size / 0.90`, adjusted for
+///    `f32` rounding), the same "whole page through pass 1" guarantee as
+///    12.0 but derived from the page's own text rather than a constant —
+///    included as a second, page-scaled safety net alongside 12.0.
+///
+/// The margins on the divisors (`1.049` instead of `1.05`, `0.899` instead
+/// of `0.90`) exist because dividing and then re-multiplying by the exact
+/// same bound is precise in real-number math but not guaranteed in `f32`; a
+/// base that lands a hair on the wrong side of its own bound would exclude
+/// the very item that was supposed to set it.
+pub(crate) fn small_type_candidate_bases(items: &[TextItem]) -> Vec<f32> {
+    let mut min_size = f32::MAX;
+    let mut max_size = 0.0_f32;
+    for item in items {
+        if item.font_size > 0.0 {
+            min_size = min_size.min(item.font_size);
+            max_size = max_size.max(item.font_size);
+        }
+    }
+
+    if max_size <= 0.0 {
+        return vec![12.0];
+    }
+
+    let mut candidates = Vec::new();
+
+    let pass2_base = max_size / 1.049;
+    // Strict margin (`* 1.001`) so a size sitting exactly on pass 1's own
+    // boundary is never treated as "safely outside" it by a hair of `f32`
+    // rounding.
+    if min_size > pass2_base * 0.90 * 1.001 {
+        candidates.push(pass2_base);
+    }
+
+    candidates.push(12.0);
+    candidates.push(max_size / 0.899);
+
+    candidates
+}
+
 /// Extract per-page geometry (text items, line segments, rects, image
 /// placeholders, and detected tables) from a PDF memory buffer.
 ///
@@ -676,45 +745,6 @@ pub struct PageGeometry {
 /// cannot be processed through this entry point. `process_pdf_with_options`
 /// takes `PdfOptions::password`; plumbing the same through here is a
 /// deliberate follow-up, not an oversight.
-/// Base font size for an all-small-type page: everything on the page is
-/// below `calculate_font_stats_from_items`'s 9pt counting floor, so that
-/// helper has nothing to average and reports its own fixed 12.0 fallback.
-///
-/// This recomputes the page's most-common size with NO size floor (every
-/// text item counts, including sub-9pt ones), and — unlike
-/// `calculate_font_stats_from_items`, which breaks a tied count toward the
-/// SMALLER size — breaks a tie toward the LARGER size. That tie direction
-/// is the one load-bearing choice here, and it is not a coin flip: on a
-/// page that mixes a handful of large title-line items into an otherwise
-/// uniform small-type body (the case the 720-config sweep below stresses
-/// separately from the uniform-body sweep), the body size is almost always
-/// still the outright most-common count, so the tie-break only matters on
-/// perfectly balanced pages — and there, preferring the larger size keeps
-/// the base an upper bound on more of the page's own text, which is what
-/// both heuristic passes need (see the module doc on
-/// `small_type_grid_needs_the_permissive_base_not_the_page_mode` in
-/// `detect_heuristic.rs` for why the direction of that inequality matters).
-/// Falls back to 12.0 only if the page has no sized text at all.
-pub(crate) fn small_type_page_base_font_size(items: &[TextItem]) -> f32 {
-    use std::collections::HashMap;
-
-    let mut size_counts: HashMap<i32, usize> = HashMap::new();
-    for item in items {
-        if item.font_size > 0.0 {
-            let size_key = (item.font_size * 10.0) as i32;
-            *size_counts.entry(size_key).or_insert(0) += 1;
-        }
-    }
-
-    size_counts
-        .iter()
-        .max_by(|(size_a, count_a), (size_b, count_b)| {
-            count_a.cmp(count_b).then_with(|| size_a.cmp(size_b))
-        })
-        .map(|(size, _)| *size as f32 / 10.0)
-        .unwrap_or(12.0)
-}
-
 pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -826,24 +856,24 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
         // body-font pass in two ways that matter — its content check rejects
         // 2-column key/value tables with text (not numeric) values, and its
         // fixed 30pt row-gap threshold (vs. pass 2's adaptive median-gap×3)
-        // misses tables with wider row spacing. A 720-config synthetic sweep
-        // (`page_geometry_small_type_base_size_sweep` below) measured this:
-        // the fixed 12.0 fallback loses 384/720 configs a page-derived base
-        // recovers, with zero configs found only at 12.0. Falling back to
-        // the page's own most-common size instead (still ignoring the 9pt
-        // floor for this fallback path only, and breaking ties toward the
-        // LARGER size rather than the smaller one `calculate_font_stats`
-        // uses) recovers all but 1 of those 720 configs without losing any
-        // config the 12.0 fallback found, and without introducing false
-        // positives on prose pages in the same sweep. See that test's
-        // module doc comment for why "toward the larger size" matters once
-        // a title line is mixed into an otherwise-uniform small-type page.
+        // misses tables with wider row spacing.
+        //
+        // For an all-small-type page, no SINGLE derived base is safe to
+        // trust blind — see `tables::detect_small_type_tables`'s doc
+        // comment for why a most-common-size base, and even a base chosen
+        // to fit the page's whole size range inside one detection pass, can
+        // each still silently drop cells on a MIXED-size table (e.g. 8pt
+        // labels beside 7pt values). Instead of picking one base and hoping,
+        // the small-type branch below tries several candidate bases and
+        // keeps whichever recovers the most source items — provably never
+        // worse than the old fixed-12.0 fallback, since 12.0 is always one
+        // of the candidates tried. `page_geometry_small_type_base_size_sweep`
+        // plus the mixed-size fixtures around it in
+        // `tables/detect_heuristic.rs` measure this against the old
+        // fixed-12.0 baseline.
         let base_stats = markdown::analysis::calculate_font_stats_from_items(&detector_items);
-        let base_font_size = if base_stats.total_lines == 0 {
-            small_type_page_base_font_size(&detector_items)
-        } else {
-            base_stats.most_common_size
-        };
+        let is_small_type_page = base_stats.total_lines == 0;
+        let base_font_size = base_stats.most_common_size;
 
         let mut page_tables = Vec::new();
         // Indices (into `page_items`) already claimed by a structural
@@ -901,8 +931,11 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
             .map(|(item, &original)| (item.clone(), original))
             .unzip();
         if !unclaimed_items.is_empty() {
-            let mut heuristic_tables =
-                tables::detect_tables(&unclaimed_items, base_font_size, false);
+            let mut heuristic_tables = if is_small_type_page {
+                tables::detect_small_type_tables(&unclaimed_items)
+            } else {
+                tables::detect_tables(&unclaimed_items, base_font_size, false)
+            };
             // `item_indices` come back indexed into `unclaimed_items`; map
             // them back to `page_items` so a consumer can correlate a table
             // with the `text_items` array it was handed.
