@@ -686,6 +686,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         recover_header_row(&mut table, &all_items, 9.0);
@@ -705,6 +706,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![0, 1],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         let rows_before = table.rows.len();
@@ -730,6 +732,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         recover_header_row(&mut table, &all_items, 9.0);
@@ -751,6 +754,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()], vec!["C".into(), "D".into()]],
             item_indices: vec![2, 3],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         let rows_before = table.rows.len();
@@ -772,6 +776,7 @@ mod tests {
             cells: vec![vec!["A".into(), "B".into()]],
             item_indices: vec![1, 2],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         let rows_before = table.rows.len();
@@ -788,6 +793,7 @@ mod tests {
             cells: vec![],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         recover_header_row(&mut table, &all_items, 9.0);

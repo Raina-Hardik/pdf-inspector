@@ -9,7 +9,7 @@ use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
     recover_header_row,
 };
-use super::{Table, TableDetectionMode};
+use super::{Table, TableDetectionMode, TableSource, MAX_TABLE_COLUMNS};
 
 /// PDF text is often emitted as one item per glyph. That produces
 /// hundreds of single-char items that confuse column detection. This function
@@ -1303,7 +1303,13 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     }
     number_x.sort_by(|a, b| a.total_cmp(b));
     let columns = vec![title_x, number_x[number_x.len() / 2]];
-    let table = Table::new(columns, rows[first..=last].to_vec(), cells, item_indices);
+    let table = Table::with_source(
+        columns,
+        rows[first..=last].to_vec(),
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    );
     if table.kind != super::TableKind::Toc {
         debug!(
             "  contents list rejected: {} rows do not classify as a contents table",
@@ -1344,11 +1350,12 @@ fn detect_table_in_region(
     }
     let columns = find_column_boundaries(&geometry_items, mode);
     let min_cols = 2;
-    if columns.len() < min_cols || columns.len() > 25 {
+    if columns.len() < min_cols || columns.len() > MAX_TABLE_COLUMNS {
         log::debug!(
-            "  detect_table_in_region: rejected {} cols (need {}..25)",
+            "  detect_table_in_region: rejected {} cols (need {}..{})",
             columns.len(),
-            min_cols
+            min_cols,
+            MAX_TABLE_COLUMNS
         );
         return None;
     }
@@ -1587,7 +1594,13 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
-    Some(Table::new(columns, rows, cells, item_indices))
+    Some(Table::with_source(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    ))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
