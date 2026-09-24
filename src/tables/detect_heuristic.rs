@@ -3025,11 +3025,29 @@ mod tests {
     ///
     /// `calculate_font_stats_from_items` answers 12.0 when nothing clears its
     /// 9pt floor, which satisfies that for any small-type page. Lowering the
-    /// base to the page's own mode does not: on a page mixing 7pt and 8pt the
-    /// mode is a tie, the tie breaks toward the smaller size, and the 8pt
-    /// items then sit below their own `0.952 * 8 = 7.62` floor — excluded
-    /// from both passes, taking the candidate count under the six-item
-    /// minimum and the table with it.
+    /// base to the page's own mode is not automatically safe either: on a
+    /// page mixing 7pt and 8pt, a mode that ties and breaks toward the
+    /// SMALLER size sends the 8pt items below their own `0.952 * 8 = 7.62`
+    /// floor — excluded from both passes, taking the candidate count under
+    /// the six-item minimum and the table with it.
+    ///
+    /// It is a mistake to read pass 1 (small-font) as the "permissive" one
+    /// on the strength of this inequality alone: item-selection is only
+    /// half of what a pass validates. Pass 1 is *stricter* than pass 2
+    /// (body-font) on both table validation and row grouping —
+    /// `has_table_like_content` only bypasses its content check for a
+    /// 2-column table in `TableDetectionMode::BodyFont`, so a key/value
+    /// table with prose (not numeric) values never clears pass 1 no matter
+    /// what base admits it as a candidate, and pass 1's row grouping uses a
+    /// fixed 30pt gap (`find_table_regions`) where pass 2 uses an adaptive
+    /// median-gap×3 (`find_table_regions_strict`) — a small-type page whose
+    /// base falls back to a fixed 12.0 is confined to the *stricter* pass by
+    /// construction. Fixing the fallback (below, in `lib.rs`'s
+    /// `small_type_page_base_font_size`) is what lets such a page reach
+    /// pass 2 at all; this test only pins the tie-break direction that
+    /// `small_type_page_base_font_size` uses within the fallback path,
+    /// scoped to `detect_tables`'s own inequality so a future edit does not
+    /// re-break it without noticing.
     ///
     /// This test exists so that fix is not re-attempted without measuring it.
     #[test]
@@ -3065,20 +3083,235 @@ mod tests {
         assert_eq!(detect_tables(&mixed, 12.0, false).len(), 1);
         assert_eq!(detect_tables(&uniform, 12.0, false).len(), 1);
 
-        // The page's own mode loses the mixed one: the 7.0/8.0 tie breaks to
-        // 7.0, which is below the 8pt labels' own 7.62 floor, so they are not
-        // candidates for either pass.
+        // A page-mode base that ties toward the SMALLER size loses the mixed
+        // grid: 7.0 is below the 8pt labels' own 7.62 floor, so they are not
+        // candidates for either pass. This is why `small_type_page_base_font_size`
+        // (`lib.rs`) ties toward the LARGER size instead — see that function's
+        // doc comment and the 720-config sweep below.
         assert_eq!(
             detect_tables(&mixed, 7.0, false).len(),
             0,
-            "if this now finds the table the dead zone has moved — re-measure \
-             before changing the per-page base"
+            "if this now finds the table, the tie-break-toward-smaller dead \
+             zone has moved — re-measure before changing this assertion, and \
+             check small_type_page_base_font_size's tie-break direction still \
+             avoids it"
         );
         assert_eq!(detect_tables(&uniform, 7.6, false).len(), 1);
 
         // It is the tie-break direction, not smallness, that loses it: the
         // same page at base 8.0 — above every item's floor — is found again.
         assert_eq!(detect_tables(&mixed, 8.0, false).len(), 1);
+    }
+
+    /// Build a uniform-font-size, `rows` x `cols` grid of table-shaped
+    /// items, one row per `row_spacing` points of Y. `textual` selects
+    /// short prose-like cell values (exercising `has_table_like_content`'s
+    /// content check) instead of numeric ones.
+    fn small_type_grid_items(
+        font_size: f32,
+        rows: usize,
+        cols: usize,
+        row_spacing: f32,
+        textual: bool,
+    ) -> Vec<TextItem> {
+        const WORDS: &[&str] = &[
+            "Approved",
+            "Pending",
+            "Rejected",
+            "Closed",
+            "Draft",
+            "Active",
+            "On hold",
+            "Expired",
+            "Review",
+            "Filed",
+            "Open",
+            "Escalated",
+        ];
+        let mut items = Vec::new();
+        for r in 0..rows {
+            let y = 500.0 - r as f32 * row_spacing;
+            for c in 0..cols {
+                let x = 60.0 + c as f32 * 120.0;
+                let text = if textual {
+                    WORDS[(r * cols + c) % WORDS.len()].to_string()
+                } else {
+                    format!("{}", 100 + r * 37 + c * 11)
+                };
+                let width = text.len() as f32 * font_size * 0.5;
+                items.push(make_item(&text, x, y, font_size, width));
+            }
+        }
+        items
+    }
+
+    /// A single-column prose page at a small uniform size: `lines` short
+    /// sentences, one per `line_spacing` points of Y, meant to find zero
+    /// tables regardless of base.
+    fn small_type_prose_items(font_size: f32, lines: usize, line_spacing: f32) -> Vec<TextItem> {
+        (0..lines)
+            .map(|i| {
+                let y = 500.0 - i as f32 * line_spacing;
+                let text = format!(
+                    "This is paragraph line number {i} of running prose text, not a table."
+                );
+                make_item(
+                    &text,
+                    60.0,
+                    y,
+                    font_size,
+                    text.len() as f32 * font_size * 0.5,
+                )
+            })
+            .collect()
+    }
+
+    /// The regression this whole module exists to close: a 2-column
+    /// key/value table whose VALUES are short text (not numbers). At the
+    /// fixed 12.0 fallback such a page only ever reaches pass 1
+    /// (small-font), and pass 1's content check
+    /// (`has_table_like_content`) has no 2-column text bypass — only pass 2
+    /// (body-font) does. `small_type_page_base_font_size` fixes this by
+    /// deriving a base the page's own text actually clears the small-font
+    /// threshold at, pushing these items into pass 2 instead.
+    #[test]
+    fn key_value_text_table_needs_page_derived_base() {
+        let items = small_type_grid_items(7.5, 4, 2, 14.0, true);
+
+        assert_eq!(
+            detect_tables(&items, 12.0, false).len(),
+            0,
+            "sanity: the fixed 12.0 fallback must still fail to find this \
+             table, or this test no longer demonstrates the regression"
+        );
+
+        let derived_base = crate::small_type_page_base_font_size(&items);
+        assert_eq!(
+            detect_tables(&items, derived_base, false).len(),
+            1,
+            "a page-derived base should reach the body-font pass, which has \
+             the 2-column short-text content bypass pass 1 lacks"
+        );
+    }
+
+    /// The second regression case: a numeric table whose rows are spaced
+    /// wider than pass 1's fixed 30pt gap threshold. At 12.0 such a page
+    /// only ever reaches pass 1 (`find_table_regions`'s fixed 30pt gap),
+    /// which splits every row into its own undersized region. Pass 2
+    /// (`find_table_regions_strict`) uses an adaptive median-gap×3 window
+    /// and groups them correctly.
+    #[test]
+    fn wide_row_spacing_numeric_table_needs_page_derived_base() {
+        let items = small_type_grid_items(7.0, 3, 3, 35.0, false);
+
+        assert_eq!(
+            detect_tables(&items, 12.0, false).len(),
+            0,
+            "sanity: the fixed 12.0 fallback must still fail to find this \
+             table, or this test no longer demonstrates the regression"
+        );
+
+        let derived_base = crate::small_type_page_base_font_size(&items);
+        assert_eq!(
+            detect_tables(&items, derived_base, false).len(),
+            1,
+            "a page-derived base should push these items past pass 1's \
+             30pt-<=6.3pt threshold band entirely, reaching pass 2's \
+             adaptive row-gap grouping"
+        );
+    }
+
+    /// The 720-config sweep from Hardik's PR #1 review, reproduced and
+    /// widened (840 configs: 5 sizes × 4 row-counts × 3 column-counts ×
+    /// 7 row-spacings × 2 content shapes) against `detect_tables` directly,
+    /// comparing the fixed 12.0 fallback against
+    /// `small_type_page_base_font_size`'s page-derived one.
+    ///
+    /// This is a measurement, not a pinned golden count: individual counts
+    /// will drift if `detect_heuristic.rs`'s validation rules change, which
+    /// is expected. What must NOT change is the shape of the result: the
+    /// page-derived base must never lose a config the fixed fallback found
+    /// (a real regression), and it must recover a large share of what the
+    /// fixed fallback lost, without inventing tables on prose pages.
+    #[test]
+    fn page_geometry_small_type_base_size_sweep() {
+        let sizes = [6.5_f32, 7.0, 7.5, 8.0, 8.5];
+        let row_counts = [3usize, 4, 5, 6];
+        let col_counts = [2usize, 3, 4];
+        let spacings = [9.0_f32, 14.0, 20.0, 25.0, 30.0, 35.0, 40.0];
+        let content_shapes = [false, true]; // numeric, then textual
+
+        let mut total = 0usize;
+        let mut found_old = 0usize;
+        let mut found_new = 0usize;
+        let mut lost_at_new = 0usize;
+        let mut gained_at_new = 0usize;
+
+        for &size in &sizes {
+            for &rows in &row_counts {
+                for &cols in &col_counts {
+                    for &spacing in &spacings {
+                        for &textual in &content_shapes {
+                            total += 1;
+                            let items = small_type_grid_items(size, rows, cols, spacing, textual);
+                            let base_new = crate::small_type_page_base_font_size(&items);
+
+                            let old_hit = !detect_tables(&items, 12.0, false).is_empty();
+                            let new_hit = !detect_tables(&items, base_new, false).is_empty();
+
+                            if old_hit {
+                                found_old += 1;
+                            }
+                            if new_hit {
+                                found_new += 1;
+                            }
+                            if old_hit && !new_hit {
+                                lost_at_new += 1;
+                            }
+                            if new_hit && !old_hit {
+                                gained_at_new += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "page_geometry_small_type_base_size_sweep: {total} configs — \
+             fixed-12.0 found {found_old}, page-derived found {found_new} \
+             ({gained_at_new} newly recovered, {lost_at_new} lost)"
+        );
+
+        assert_eq!(
+            lost_at_new, 0,
+            "page-derived base must never lose a table the fixed 12.0 \
+             fallback found — that would be a new regression, not a fix"
+        );
+        assert!(
+            gained_at_new > 0,
+            "the sweep should recover at least some of the configs Hardik's \
+             review found lost at the fixed 12.0 fallback"
+        );
+        assert!(
+            found_new > found_old,
+            "page-derived base ({found_new}) should find strictly more \
+             tables than the fixed 12.0 fallback ({found_old}) across this sweep"
+        );
+
+        // False-positive check: prose pages at the same small sizes must
+        // find zero tables under EITHER base.
+        let mut prose_false_positives = 0usize;
+        for &size in &sizes {
+            let prose = small_type_prose_items(size, 25, 13.0);
+            let base_new = crate::small_type_page_base_font_size(&prose);
+            prose_false_positives += detect_tables(&prose, 12.0, false).len();
+            prose_false_positives += detect_tables(&prose, base_new, false).len();
+        }
+        assert_eq!(
+            prose_false_positives, 0,
+            "neither base should ever find a table on prose-only pages"
+        );
     }
 
     #[test]

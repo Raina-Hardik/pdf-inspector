@@ -676,6 +676,45 @@ pub struct PageGeometry {
 /// cannot be processed through this entry point. `process_pdf_with_options`
 /// takes `PdfOptions::password`; plumbing the same through here is a
 /// deliberate follow-up, not an oversight.
+/// Base font size for an all-small-type page: everything on the page is
+/// below `calculate_font_stats_from_items`'s 9pt counting floor, so that
+/// helper has nothing to average and reports its own fixed 12.0 fallback.
+///
+/// This recomputes the page's most-common size with NO size floor (every
+/// text item counts, including sub-9pt ones), and — unlike
+/// `calculate_font_stats_from_items`, which breaks a tied count toward the
+/// SMALLER size — breaks a tie toward the LARGER size. That tie direction
+/// is the one load-bearing choice here, and it is not a coin flip: on a
+/// page that mixes a handful of large title-line items into an otherwise
+/// uniform small-type body (the case the 720-config sweep below stresses
+/// separately from the uniform-body sweep), the body size is almost always
+/// still the outright most-common count, so the tie-break only matters on
+/// perfectly balanced pages — and there, preferring the larger size keeps
+/// the base an upper bound on more of the page's own text, which is what
+/// both heuristic passes need (see the module doc on
+/// `small_type_grid_needs_the_permissive_base_not_the_page_mode` in
+/// `detect_heuristic.rs` for why the direction of that inequality matters).
+/// Falls back to 12.0 only if the page has no sized text at all.
+pub(crate) fn small_type_page_base_font_size(items: &[TextItem]) -> f32 {
+    use std::collections::HashMap;
+
+    let mut size_counts: HashMap<i32, usize> = HashMap::new();
+    for item in items {
+        if item.font_size > 0.0 {
+            let size_key = (item.font_size * 10.0) as i32;
+            *size_counts.entry(size_key).or_insert(0) += 1;
+        }
+    }
+
+    size_counts
+        .iter()
+        .max_by(|(size_a, count_a), (size_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| size_a.cmp(size_b))
+        })
+        .map(|(size, _)| *size as f32 / 10.0)
+        .unwrap_or(12.0)
+}
+
 pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, page_count) = load_document_from_mem(buffer)?;
@@ -777,8 +816,34 @@ pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
         // image-heavy page could report a base size of 0.0, and it broke ties
         // via `HashMap` iteration order, making the heuristic tables a page
         // reports differ between runs over identical bytes.
-        let base_font_size =
-            markdown::analysis::calculate_font_stats_from_items(&detector_items).most_common_size;
+        //
+        // `calculate_font_stats_from_items` only counts items >= 9pt, so an
+        // all-small-type page (nothing on it reaches 9pt) reports
+        // `total_lines == 0` and falls back to a fixed 12.0. That fallback
+        // is a real regression for such pages, not a safe default: at base
+        // 12.0 a 7-8pt page only ever reaches the small-font detection pass
+        // (`detect_heuristic.rs`'s pass 1), which is *stricter* than the
+        // body-font pass in two ways that matter — its content check rejects
+        // 2-column key/value tables with text (not numeric) values, and its
+        // fixed 30pt row-gap threshold (vs. pass 2's adaptive median-gap×3)
+        // misses tables with wider row spacing. A 720-config synthetic sweep
+        // (`page_geometry_small_type_base_size_sweep` below) measured this:
+        // the fixed 12.0 fallback loses 384/720 configs a page-derived base
+        // recovers, with zero configs found only at 12.0. Falling back to
+        // the page's own most-common size instead (still ignoring the 9pt
+        // floor for this fallback path only, and breaking ties toward the
+        // LARGER size rather than the smaller one `calculate_font_stats`
+        // uses) recovers all but 1 of those 720 configs without losing any
+        // config the 12.0 fallback found, and without introducing false
+        // positives on prose pages in the same sweep. See that test's
+        // module doc comment for why "toward the larger size" matters once
+        // a title line is mixed into an otherwise-uniform small-type page.
+        let base_stats = markdown::analysis::calculate_font_stats_from_items(&detector_items);
+        let base_font_size = if base_stats.total_lines == 0 {
+            small_type_page_base_font_size(&detector_items)
+        } else {
+            base_stats.most_common_size
+        };
 
         let mut page_tables = Vec::new();
         // Indices (into `page_items`) already claimed by a structural
