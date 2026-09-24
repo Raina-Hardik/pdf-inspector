@@ -40,7 +40,7 @@ pub mod structured;
 
 pub use detect_heuristic::detect_tables;
 pub(crate) use detect_heuristic::{
-    content_width, detect_tables_with_page_width, is_table_of_contents,
+    content_width, detect_small_type_tables, detect_tables_with_page_width, is_table_of_contents,
 };
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_lines::{
@@ -211,11 +211,16 @@ pub(crate) fn try_build_rect_guided_table(
     used_indices.sort_unstable();
     used_indices.dedup();
 
-    Some(Table::new(
+    Some(Table::with_source(
         col_boundaries,
         row_boundaries,
         cells,
         used_indices,
+        // `Rects`, not `Heuristic`: the column boundaries above come from the
+        // cluster's real `re` rect X positions. Only the row boundaries are
+        // text-derived, and a table whose columns are vector geometry is not
+        // a text-density detection.
+        TableSource::Rects,
     ))
 }
 
@@ -702,7 +707,13 @@ pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Opt
         multi_col_rows
     );
 
-    Some(Table::new(col_xs, row_ys, cells, item_indices))
+    Some(Table::with_source(
+        col_xs,
+        row_ys,
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    ))
 }
 
 /// Build a region-scoped two-column key/value table from text baselines.
@@ -946,11 +957,12 @@ pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32)
         split_x
     );
 
-    Some(Table::new(
+    Some(Table::with_source(
         vec![left_x, right_x],
         table_rows,
         cells,
         item_indices,
+        TableSource::Heuristic,
     ))
 }
 
@@ -1532,8 +1544,67 @@ pub enum TableKind {
     Toc,
 }
 
+/// Which detector produced a `Table`. Additive discriminator for FFI
+/// consumers (`ffi_page_geometry`) that need to weight or filter tables by
+/// how they were found; markdown rendering never reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableSource {
+    /// The producer did not record one — the default, so that
+    /// [`Table::new`] keeps its pre-existing four-argument signature and no
+    /// external caller is broken by this field existing.
+    #[default]
+    Unspecified,
+    /// Detected from PDF path-operator line segments (`detect_lines.rs`).
+    Lines,
+    /// Detected from PDF `re` rectangle operators (`detect_rects.rs`).
+    Rects,
+    /// Detected from the PDF structure tree's `Table`/`TR`/`TD` tags
+    /// (`detect_struct.rs`).
+    Struct,
+    /// Detected from text-position clustering alone, no vector graphics
+    /// (`detect_heuristic.rs`, `grid.rs`).
+    Heuristic,
+}
+
+/// The rect that geometrically covers a table cell: either the cell's own
+/// detected rectangle, or — when the cell is covered by a merged/spanned
+/// neighbour — that neighbour's rect, so a consumer can fill down from the
+/// correct source cell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Per-cell occupancy signal, parallel to `Table::cells`. Distinguishes a
+/// cell whose text came from its own detected rectangle from one a detector
+/// observed being covered by a merged neighbour's rectangle. This is real
+/// detector evidence, not a guess from `cells[r][c].is_empty()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellOccupancy {
+    /// True when this position's geometry is its own single grid slot. False
+    /// only when a real detected rect bigger than one slot was observed
+    /// covering it.
+    ///
+    /// For a multi-row rect the test is whether the merged-cell fold actually
+    /// collapsed those rows, NOT whether the decoration predicate likes the
+    /// rect: a rect the fold applied is evidence even when that predicate
+    /// would have called it a shading band, because the cell text really was
+    /// moved and `is_own = true` over moved text is a contradiction. A rect
+    /// the fold left alone is not evidence even when the predicate would have
+    /// allowed it. Single-row rects drive no fold, so for them the decoration
+    /// classification still decides.
+    pub is_own: bool,
+    /// The covering rect, when known: the merge rect when `!is_own`, this
+    /// cell's own grid slot when `is_own` and backed by rect evidence.
+    /// `None` when no detector evidence is available either way.
+    pub rect: Option<CellRect>,
+}
+
 /// A detected table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Table {
     /// Column boundaries (x positions)
     pub columns: Vec<f32>,
@@ -1545,15 +1616,60 @@ pub struct Table {
     pub item_indices: Vec<usize>,
     /// Data table vs TOC. Set by `Table::new` from `cells`.
     pub kind: TableKind,
+    /// Which detector produced this table; `Unspecified` unless the producer
+    /// said (see [`Table::with_source`]).
+    pub source: TableSource,
+    /// Per-cell occupancy/coverage, parallel to `cells` (same [row][col]
+    /// shape), when the detector that built this table tracked real per-cell
+    /// rect evidence. `None` — not an empty grid — means "this detector has
+    /// no per-cell rect signal to offer"; a consumer must not read `None` as
+    /// "all cells empty". Only `detect_rects.rs::try_build_grid` populates it
+    /// today, the one path with real `re`-rect coverage per cell.
+    pub cell_occupancy: Option<Vec<Vec<CellOccupancy>>>,
 }
 
 impl Table {
     /// Build a table and classify it (data vs TOC) from its cells.
+    ///
+    /// Signature-compatible with the pre-`TableSource` constructor: the
+    /// source is left `Unspecified` and no per-cell evidence is claimed.
     pub fn new(
         columns: Vec<f32>,
         rows: Vec<f32>,
         cells: Vec<Vec<String>>,
         item_indices: Vec<usize>,
+    ) -> Self {
+        Self::with_cell_occupancy(
+            columns,
+            rows,
+            cells,
+            item_indices,
+            TableSource::Unspecified,
+            None,
+        )
+    }
+
+    /// [`Table::new`], recording which detector produced the table.
+    pub fn with_source(
+        columns: Vec<f32>,
+        rows: Vec<f32>,
+        cells: Vec<Vec<String>>,
+        item_indices: Vec<usize>,
+        source: TableSource,
+    ) -> Self {
+        Self::with_cell_occupancy(columns, rows, cells, item_indices, source, None)
+    }
+
+    /// [`Table::with_source`] with an explicit, detector-supplied per-cell
+    /// occupancy map. Pass `Some(..)` only with genuine rect-coverage
+    /// evidence for these cells — see [`Table::cell_occupancy`].
+    pub fn with_cell_occupancy(
+        columns: Vec<f32>,
+        rows: Vec<f32>,
+        cells: Vec<Vec<String>>,
+        item_indices: Vec<usize>,
+        source: TableSource,
+        cell_occupancy: Option<Vec<Vec<CellOccupancy>>>,
     ) -> Self {
         let kind = if is_table_of_contents(&cells) {
             TableKind::Toc
@@ -1566,6 +1682,8 @@ impl Table {
             cells,
             item_indices,
             kind,
+            source,
+            cell_occupancy,
         }
     }
 }
@@ -1728,6 +1846,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         let md = table_to_markdown(&table);
@@ -2510,6 +2629,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
 
         let md = table_to_markdown(&table);

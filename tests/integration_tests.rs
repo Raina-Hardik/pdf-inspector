@@ -12,9 +12,9 @@ use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    page_geometry_mem, process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options,
+    to_markdown, to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError,
+    PdfOptions, PdfType, TextItem,
 };
 use pdf_inspector::{
     detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
@@ -10070,4 +10070,1961 @@ fn document_information_entries_are_decoded_in_every_result() {
     let detect_only = process_pdf_mem_with_options(&pdf, PdfOptions::detect_only()).unwrap();
     assert_eq!(detect_only.producer.as_deref(), Some("Test Library 1.0"));
     assert_eq!(detect_only.author.as_deref(), Some("José Martínez"));
+}
+
+// ============================================================================
+// page_geometry_mem (Phase 0: page-geometry FFI)
+// ============================================================================
+
+/// A one-page PDF with `content` as its content stream, an `/Im0` image
+/// XObject in its resources (so `/Im0 Do` yields an image placeholder item)
+/// and Helvetica as `/F1`.
+fn make_pdf_with_image_xobject(content: &str, media_box: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        &format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+             /Contents 4 0 R >>"
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(&mut pdf, &mut offsets, 5, HELVETICA_FONT);
+    let image_data = vec![0u8; 100];
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n");
+    pdf.extend_from_slice(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width 10 /Height 10 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+            image_data.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&image_data);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_offset
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_page_geometry_mem_basic_text_and_rotation() {
+    let content = "BT
+/F1 12 Tf
+1 0 0 1 100 700 Tm
+(Horizontal) Tj
+ET
+BT
+/F1 12 Tf
+0 1 -1 0 200 700 Tm
+(Rotated) Tj
+ET";
+    let pdf = make_text_pdf(content, "0 0 612 792");
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+    let page = &pages[0];
+    assert_eq!(page.page, 1);
+
+    let horizontal = page
+        .text_items
+        .iter()
+        .find(|i| i.text == "Horizontal")
+        .expect("horizontal item present");
+    assert!(horizontal.rotation.abs() < 0.5);
+
+    let rotated = page
+        .text_items
+        .iter()
+        .find(|i| i.text == "Rotated")
+        .expect("rotated item present");
+    assert!(
+        (rotated.rotation - 90.0).abs() < 0.5,
+        "expected ~90 degrees, got {}",
+        rotated.rotation
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_reports_image_placeholder() {
+    // Build a page with an image XObject via the same lopdf helpers the
+    // content_stream unit tests use, but through the public buffer API so
+    // this exercises page_geometry_mem end to end.
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut doc = Document::new();
+    let image_id = doc.add_object(Object::Stream(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 10,
+            "Height" => 10,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![0u8; 100],
+    )));
+    let content = b"q 50 0 0 50 100 600 cm /Im0 Do Q";
+    let content_id = doc.add_object(Object::Stream(Stream::new(
+        dictionary! {},
+        content.to_vec(),
+    )));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Contents" => Object::Reference(content_id),
+        "Resources" => dictionary! {
+            "XObject" => dictionary! {
+                "Im0" => Object::Reference(image_id),
+            },
+        },
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Count" => Object::Integer(1),
+        "Kids" => vec![Object::Reference(page_id)],
+    });
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf).expect("save synthetic pdf");
+
+    let pages = page_geometry_mem(&buf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+    let image = pages[0]
+        .images
+        .iter()
+        .find(|im| im.xobject_name == "Im0")
+        .expect("image placeholder should be reported");
+    assert_eq!(image.page, 1);
+    assert!(image.width > 0.0);
+    assert!(image.height > 0.0);
+}
+
+#[test]
+fn test_page_geometry_mem_detects_rect_table_with_cell_occupancy() {
+    // A small 2x2 grid of `re` rects with text in each cell, laid out to
+    // pass detect_tables_from_rects's structural checks.
+    let content = "q
+0 0 0 rg
+10 60 100 20 re f
+120 60 100 20 re f
+10 30 100 20 re f
+120 30 100 20 re f
+Q
+BT
+/F1 10 Tf
+1 0 0 1 15 65 Tm (H1) Tj
+1 0 0 1 125 65 Tm (H2) Tj
+1 0 0 1 15 35 Tm (D1) Tj
+1 0 0 1 125 35 Tm (D2) Tj
+ET";
+    let pdf = make_text_pdf(content, "0 0 300 200");
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+
+    // detect_tables_from_rects requires a real grid; this fixture is
+    // intentionally small and may not always clear every threshold, so
+    // assert on rects/text having been captured (the geometry signal this
+    // test targets) and, when a table IS detected, that its source and
+    // cell_occupancy shape are self-consistent.
+    assert!(!pages[0].rects.is_empty(), "rects should be captured");
+    assert!(
+        !pages[0].text_items.is_empty(),
+        "text items should be captured"
+    );
+
+    for table in &pages[0].tables {
+        match table.source {
+            pdf_inspector::tables::TableSource::Rects => {
+                if let Some(occupancy) = &table.cell_occupancy {
+                    assert_eq!(occupancy.len(), table.cells.len());
+                    for (occ_row, cell_row) in occupancy.iter().zip(&table.cells) {
+                        assert_eq!(occ_row.len(), cell_row.len());
+                    }
+                }
+            }
+            pdf_inspector::tables::TableSource::Heuristic => {
+                assert!(table.cell_occupancy.is_none());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_merged_cell_occupancy_reflects_real_rect() {
+    // Regression test for reviewer finding B1: `is_own` must reflect
+    // whether a grid position is backed by its OWN single-slot geometry,
+    // not whether the cell's text happens to be non-empty, and a
+    // fold-in merge TARGET's `rect` must be the real detected `re` rect
+    // that spans multiple grid rows — not a synthesized single-slot rect.
+    //
+    // Grid: 3 columns x 3 rows (full grid detection requires >= 6 rects,
+    // so 3 columns is the minimum that clears that gate while keeping one
+    // genuine rowspan).
+    //   row0 (header): col0 "H1", col1 "H2", col2 "H3" — ordinary cells.
+    //   row1+row2, col0: ONE real `re` rect spans both rows (a genuine
+    //     rowspan), with two separate text items ("M1" in row1's band,
+    //     "M2" in row2's band) that `propagate_merged_cells` folds
+    //     together into row1, clearing row2.
+    //   row1, row2, col1 and col2: ordinary per-row rects/text, no merge.
+    let content = "q
+0 0 0 rg
+0 120 100 40 re f
+100 120 100 40 re f
+200 120 100 40 re f
+0 40 100 80 re f
+100 80 100 40 re f
+100 40 100 40 re f
+200 80 100 40 re f
+200 40 100 40 re f
+Q
+BT
+/F1 10 Tf
+1 0 0 1 30 135 Tm (H1) Tj
+1 0 0 1 130 135 Tm (H2) Tj
+1 0 0 1 230 135 Tm (H3) Tj
+1 0 0 1 30 100 Tm (M1) Tj
+1 0 0 1 30 60 Tm (M2) Tj
+1 0 0 1 130 95 Tm (D1) Tj
+1 0 0 1 130 55 Tm (D2) Tj
+1 0 0 1 230 95 Tm (E1) Tj
+1 0 0 1 230 55 Tm (E2) Tj
+ET";
+    let pdf = make_text_pdf(content, "0 0 300 200");
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+
+    let table = pages[0]
+        .tables
+        .iter()
+        .find(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .expect("a real re-rect-backed table should be detected from this fixture");
+
+    let occ = table
+        .cell_occupancy
+        .as_ref()
+        .expect("cell_occupancy should be populated for a Rects-source table");
+
+    assert_eq!(
+        table.cells.len(),
+        3,
+        "expected 3 grid rows (header + 2 data rows)"
+    );
+    assert_eq!(table.cells[0].len(), 3, "expected 3 grid columns");
+
+    // Row1/col0 is the fold-in TARGET: it still holds the combined text
+    // ("M1 M2"), so a naive "is_own = non-empty" predicate reports it as
+    // is_own=true with a synthesized one-grid-slot rect. It must instead
+    // report is_own=false, with a REAL rect wider/taller than one grid
+    // slot — this is the exact FFI-emitted shape the old synthetic-only
+    // test (TestFillDown_DirectionAware, agx-side) never exercised.
+    let target = &occ[1][0];
+    assert!(
+        !target.is_own,
+        "merge fold-in target must not report is_own=true merely because its text is non-empty"
+    );
+    let target_rect = target
+        .rect
+        .expect("merge target must carry the real covering rect, not None");
+    let one_row_height = 40.0;
+    assert!(
+        target_rect.height > one_row_height * 1.5,
+        "merge target's rect must be the real merged extent (~80), not a synthesized single-row slot (~40); got height={}",
+        target_rect.height
+    );
+    assert!(
+        target.rect.unwrap().width >= 99.0,
+        "merge target's rect must still span the real column width"
+    );
+    assert_eq!(
+        table.cells[1][0], "M1 M2",
+        "fold-in target should hold the combined text from both merged sub-rows"
+    );
+
+    // Row2/col0 is the cell `propagate_merged_cells` cleared. It was
+    // already correct before this fix (is_own=false, real covering
+    // rect) — assert it stays that way.
+    let cleared = &occ[2][0];
+    assert!(
+        !cleared.is_own,
+        "cleared merge sub-row must be is_own=false"
+    );
+    let cleared_rect = cleared
+        .rect
+        .expect("cleared cell must carry the real covering rect");
+    assert!(cleared_rect.height > one_row_height * 1.5);
+    assert_eq!(
+        table.cells[2][0], "",
+        "cleared sub-row's own text must be empty"
+    );
+
+    // Columns 1 and 2 (D1/D2, E1/E2) were never part of a merge: ordinary
+    // non-empty cells keep is_own=true with a single-slot synthesized rect.
+    for (row, occ_row) in occ.iter().enumerate().take(3).skip(1) {
+        for (col, ordinary) in occ_row.iter().enumerate().take(3).skip(1) {
+            assert!(
+                ordinary.is_own,
+                "row {} col{} is an ordinary unmerged cell and must report is_own=true",
+                row, col
+            );
+            let r = ordinary
+                .rect
+                .expect("ordinary cell must carry its own synthesized rect");
+            assert!(
+                r.height <= one_row_height * 1.2,
+                "ordinary cell's rect must be a single grid slot, not a merged extent; got height={}",
+                r.height
+            );
+        }
+    }
+
+    // Header row cells are ordinary, unmerged, non-empty.
+    assert!(occ[0][0].is_own);
+    assert!(occ[0][1].is_own);
+    assert!(occ[0][2].is_own);
+}
+
+/// A two-page document whose SECOND page carries a dense ruled-line grid
+/// drawn entirely with `m`/`l` stroke operators and **no `re` fill at all**,
+/// with one text item per cell.
+///
+/// Every row and column boundary is one full-span rule, so the page's only
+/// vector geometry is the grid itself.
+///
+/// This replaces a trimmed page pair from a proprietary vendor datasheet that
+/// cannot be redistributed. The geometry it reproduces is the part the
+/// regression is about: a table whose ONLY signal is ruled lines.
+fn synthetic_ruled_grid_second_page_pdf(num_cols: usize, num_rows: usize) -> Vec<u8> {
+    use lopdf::content::{Content, Operation};
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    const COL_W: i64 = 60;
+    const X0: i64 = 50;
+    const Y_TOP: i64 = 730;
+    // Deliberately NOT a constant row height. `detect_tables_from_lines`
+    // rejects a grid whose row spacing has a coefficient of variation below
+    // 0.02 as chart gridlines, and a real datasheet table's rows vary with
+    // their content. A perfectly uniform grid would be vetoed for a reason
+    // that has nothing to do with this regression.
+    const ROW_HEIGHTS: [i64; 5] = [24, 30, 26, 34, 28];
+
+    // Y of the TOP edge of row `r` (`r == num_rows` gives the bottom edge).
+    fn row_top(r: usize) -> i64 {
+        Y_TOP
+            - (0..r)
+                .map(|i| ROW_HEIGHTS[i % ROW_HEIGHTS.len()])
+                .sum::<i64>()
+    }
+
+    fn stroke(ops: &mut Vec<Operation>, ax: i64, ay: i64, bx: i64, by: i64) {
+        // A plain `m`/`l` segment — deliberately NOT `re`, which would make
+        // this a rect-detector case instead of a ruled-line one.
+        ops.push(Operation::new("m", vec![ax.into(), ay.into()]));
+        ops.push(Operation::new("l", vec![bx.into(), by.into()]));
+    }
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let page1_id = doc.new_object_id();
+    let page2_id = doc.new_object_id();
+    let font_id = doc.new_object_id();
+    let content1_id = doc.new_object_id();
+    let content2_id = doc.new_object_id();
+
+    doc.objects.insert(
+        font_id,
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+        .into(),
+    );
+
+    // Page 1: ordinary prose, no table geometry, so the assertions below are
+    // unambiguously about page 2.
+    let mut ops1 = Vec::new();
+    ops1.push(Operation::new("BT", vec![]));
+    ops1.push(Operation::new("Tf", vec!["F1".into(), 11.into()]));
+    for (i, line) in [
+        "Device Configuration Overview",
+        "The register summary for this device is given on the following page.",
+        "Each entry lists the offset, the default value and the access policy.",
+    ]
+    .iter()
+    .enumerate()
+    {
+        ops1.push(Operation::new(
+            "Tm",
+            vec![
+                1.into(),
+                0.into(),
+                0.into(),
+                1.into(),
+                72.into(),
+                (700 - 20 * i as i64).into(),
+            ],
+        ));
+        ops1.push(Operation::new("Tj", vec![Object::string_literal(*line)]));
+    }
+    ops1.push(Operation::new("ET", vec![]));
+
+    // Page 2: the ruled grid.
+    let mut ops2 = Vec::new();
+    let x_right = X0 + num_cols as i64 * COL_W;
+    let y_bottom = row_top(num_rows);
+    for r in 0..=num_rows {
+        let y = row_top(r);
+        stroke(&mut ops2, X0, y, x_right, y);
+    }
+    for c in 0..=num_cols {
+        let x = X0 + c as i64 * COL_W;
+        stroke(&mut ops2, x, y_bottom, x, Y_TOP);
+    }
+    ops2.push(Operation::new("S", vec![]));
+
+    ops2.push(Operation::new("BT", vec![]));
+    ops2.push(Operation::new("Tf", vec!["F1".into(), 8.into()]));
+    for r in 0..num_rows {
+        for c in 0..num_cols {
+            ops2.push(Operation::new(
+                "Tm",
+                vec![
+                    1.into(),
+                    0.into(),
+                    0.into(),
+                    1.into(),
+                    (X0 + c as i64 * COL_W + 6).into(),
+                    (row_top(r + 1) + 9).into(),
+                ],
+            ));
+            ops2.push(Operation::new(
+                "Tj",
+                vec![Object::string_literal(format!("R{r}C{c}"))],
+            ));
+        }
+    }
+    ops2.push(Operation::new("ET", vec![]));
+
+    for (id, ops) in [(content1_id, ops1), (content2_id, ops2)] {
+        let content = Content { operations: ops }.encode().unwrap();
+        doc.objects
+            .insert(id, Stream::new(dictionary! {}, content).into());
+    }
+
+    for (page_id, content_id) in [(page1_id, content1_id), (page2_id, content2_id)] {
+        doc.objects.insert(
+            page_id,
+            dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! {
+                        "F1" => font_id,
+                    },
+                },
+                "Contents" => content_id,
+            }
+            .into(),
+        );
+    }
+    doc.objects.insert(
+        pages_id,
+        dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page1_id.into(), page2_id.into()],
+            "Count" => 2,
+        }
+        .into(),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn test_page_geometry_mem_detects_ruled_line_table() {
+    // Regression test for the agx downstream bug report: a real ruled-grid
+    // table (8 columns, 26+ rows) had a couple of hundred `PdfLine` entries
+    // on its page forming an unmistakable grid, but `ffi_page_geometry`'s
+    // `tables` array came back completely empty for it. Root cause:
+    // `page_geometry_mem` only ever called `detect_tables_from_rects`
+    // (filled `re` rects) and the text-density heuristic `detect_tables` --
+    // it never called `tables::detect_tables_from_lines`, the detector that
+    // reads pure `l`-operator ruled borders. A table whose only geometry
+    // signal is ruled lines (no filled rects) was therefore invisible to
+    // every consumer of this FFI entry point, even though `pg.lines`
+    // plainly showed the grid.
+    //
+    // The original reproduction used a trimmed page pair from the reporting
+    // customer's vendor datasheet, which is not redistributable. The grid
+    // below is built to the same shape, with the property that matters kept
+    // exact: it is drawn with `m`/`l` only, so `detect_tables_from_rects`
+    // has nothing to work with and only the line detector can find it.
+    const COLS: usize = 8;
+    const ROWS: usize = 20;
+    let pdf = synthetic_ruled_grid_second_page_pdf(COLS, ROWS);
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+
+    let page2 = pages
+        .iter()
+        .find(|p| p.page == 2)
+        .expect("document should have a page 2");
+
+    // Sanity: the raw ruled-grid geometry this regression is about is
+    // actually present before we assert anything about detection. Every one
+    // of the (ROWS + 1) row rules and (COLS + 1) column rules must have
+    // survived extraction...
+    assert!(
+        page2.lines.len() >= ROWS + COLS + 2,
+        "expected the full ruled grid on page 2, got {} lines",
+        page2.lines.len()
+    );
+    // ...and the rect geometry that the OTHER detector would have used is
+    // not, so a pass here cannot come from `detect_tables_from_rects`.
+    assert!(
+        page2.rects.is_empty(),
+        "the ruled grid must be lines only; got {} rects",
+        page2.rects.len()
+    );
+
+    let data_tables: Vec<_> = page2
+        .tables
+        .iter()
+        .filter(|t| t.kind == pdf_inspector::tables::TableKind::Data)
+        .collect();
+
+    assert!(
+        !data_tables.is_empty(),
+        "page 2's ruled-line grid table was not detected at all (tables={:?})",
+        page2
+            .tables
+            .iter()
+            .map(|t| (t.source, t.rows.len(), t.columns.len()))
+            .collect::<Vec<_>>()
+    );
+
+    // The detection must come from the ruled-line detector specifically --
+    // that is the code path the original bug never reached. A cell-per-text
+    // grid is also visible to the text-density heuristic, so this asserts
+    // that a `Lines` table is among the results rather than that it is the
+    // only one; the heuristic finding it too was never the complaint.
+    let table = *data_tables
+        .iter()
+        .find(|t| t.source == pdf_inspector::tables::TableSource::Lines)
+        .unwrap_or_else(|| {
+            panic!(
+                "the ruled grid must be found by the line detector; got sources {:?}",
+                data_tables.iter().map(|t| t.source).collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        table.columns.len() >= 7,
+        "expected at least 7 column boundaries for the {COLS}-column grid, got {}",
+        table.columns.len()
+    );
+    assert!(
+        table.rows.len() >= 15,
+        "expected a double-digit row count for this dense grid, got {}",
+        table.rows.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reviewer findings 3/4/5 — page_geometry_mem regression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_page_geometry_mem_turned_page_reports_one_consistent_frame() {
+    // When more than 2/3 of a page's text carries a rotated text matrix the
+    // extractor turns the page's coordinate frame so the dominant runs read
+    // left-to-right (`PageRotation`), and rebases each text run's baseline
+    // angle with it. `page_geometry_mem` consumes that model directly: it
+    // reports the turn on the page and applies NO correction of its own, so
+    // coordinates and per-item rotation are in one frame and a consumer
+    // cannot double-correct.
+    //
+    // This fixture is a page of exclusively 90-degree-rotated text
+    // (Tm = [0 b -b 0 tx ty]), which trips the vote.
+    let mut content = String::from("BT\n/F1 10 Tf\n");
+    for i in 0..12 {
+        let ty = 100.0 + i as f32 * 20.0;
+        content.push_str(&format!(
+            "0 10 -10 0 300 {} Tm (Rotated line {}) Tj\n",
+            ty, i
+        ));
+    }
+    content.push_str("ET");
+    let pdf = make_text_pdf_with_rotate(
+        &content,
+        "0 0 612 792",
+        None,
+        Some(90),
+        None,
+        HELVETICA_FONT,
+    );
+
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    assert_eq!(pages.len(), 1);
+    let pg = &pages[0];
+
+    assert_ne!(
+        pg.rotation,
+        PageRotation::Upright,
+        "a page of entirely 90-degree text must report a turned frame"
+    );
+    assert!(
+        !pg.text_items.is_empty(),
+        "fixture must actually produce text items"
+    );
+
+    // The crux: rotation is expressed in the same frame as the coordinates
+    // delivered beside it, so the dominant runs read as horizontal.
+    for item in &pg.text_items {
+        assert!(
+            item.rotation.abs() < 0.5,
+            "turned-page item must report its angle in the turned frame (~0), \
+             got {} for {:?}",
+            item.rotation,
+            item.text
+        );
+    }
+
+    // The visible page box is surfaced in raw user space, independent of the
+    // frame turn.
+    assert_eq!(
+        pg.page_box,
+        Some((0.0, 0.0, 612.0, 792.0)),
+        "the page's visible box must be reported in raw user space"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_unturned_page_reports_upright_frame() {
+    // Control for the test above: an ordinary horizontal page.
+    let mut content = String::from("BT\n/F1 10 Tf\n");
+    for i in 0..12 {
+        let ty = 700.0 - i as f32 * 20.0;
+        content.push_str(&format!(
+            "1 0 0 1 100 {} Tm (Horizontal line {}) Tj\n",
+            ty, i
+        ));
+    }
+    content.push_str("ET");
+    let pdf = make_text_pdf(&content, "0 0 612 792");
+
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+    assert_eq!(pg.rotation, PageRotation::Upright);
+    assert_eq!(pg.page_box, Some((0.0, 0.0, 612.0, 792.0)));
+    for item in &pg.text_items {
+        assert!(item.rotation.abs() < 0.5, "got {}", item.rotation);
+    }
+}
+
+/// Build a fully-ruled 4-column x 4-row `re`-rect table with an image
+/// placeholder sitting below it, as a real PDF content stream. The grid is
+/// dense and regular enough that the heuristic (text-density) detector would
+/// also happily claim it if it were allowed to see the same items.
+fn make_rect_table_with_image_placeholder_pdf() -> Vec<u8> {
+    const COLS: usize = 4;
+    const ROWS: usize = 4;
+    const COL_W: f32 = 90.0;
+    const ROW_H: f32 = 40.0;
+    const X0: f32 = 50.0;
+    const Y0: f32 = 400.0;
+
+    let mut content = String::from("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+            content.push_str(&format!("{} {} {} {} re f\n", x, y, COL_W, ROW_H));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W + 6.0;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H + 14.0;
+            content.push_str(&format!("1 0 0 1 {} {} Tm (R{}C{}) Tj\n", x, y, r, c));
+        }
+    }
+    content.push_str("ET\n");
+    // An image XObject drawn below the table: extraction emits an
+    // "[Image: Im0]" placeholder TextItem for it.
+    content.push_str("q\n200 0 0 60 60 300 cm /Im0 Do\nQ");
+    make_pdf_with_image_xobject(&content, "0 0 612 792")
+}
+
+#[test]
+fn test_page_geometry_mem_no_duplicate_table_and_no_placeholder_in_cells() {
+    // Reviewer finding 4. `page_geometry_mem` used to run the heuristic
+    // text-density detector over ALL page items, including the ones a
+    // rect/line detector had already claimed — so one physical table came
+    // back twice under two different `TableSource`s. It also never filtered
+    // image-placeholder or link items, so "[Image: Im0]" could land in a
+    // table cell as literal text. The real markdown pipeline
+    // (`markdown/mod.rs`'s band loop) restricts the heuristic pass to
+    // unclaimed items; this now mirrors that.
+    let pdf = make_rect_table_with_image_placeholder_pdf();
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely exercise the path: a rect-backed table.
+    let rect_tables: Vec<_> = pg
+        .tables
+        .iter()
+        .filter(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .collect();
+    assert_eq!(
+        rect_tables.len(),
+        1,
+        "fixture must produce exactly one rect-detected table; got {}",
+        rect_tables.len()
+    );
+    let rect_table = rect_tables[0];
+    // And the image placeholder must actually be present as an item,
+    // otherwise the leakage half of this test proves nothing.
+    assert!(
+        !pg.images.is_empty(),
+        "fixture must emit an image placeholder item"
+    );
+
+    // No heuristic table may re-claim the rect table's items.
+    let rect_claimed: HashSet<usize> = rect_table.item_indices.iter().copied().collect();
+    for table in &pg.tables {
+        if std::ptr::eq(table, rect_table) {
+            continue;
+        }
+        let overlap = table
+            .item_indices
+            .iter()
+            .filter(|idx| rect_claimed.contains(idx))
+            .count();
+        assert_eq!(
+            overlap, 0,
+            "table from {:?} re-claims {} item(s) already claimed by the \
+             rect-detected table — the same physical table is being returned twice",
+            table.source, overlap
+        );
+    }
+
+    // No cell anywhere may contain an image placeholder or a link marker.
+    for table in &pg.tables {
+        for row in &table.cells {
+            for cell in row {
+                assert!(
+                    !cell.contains("[Image:"),
+                    "image placeholder leaked into a {:?} table cell: {:?}",
+                    table.source,
+                    cell
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_column_spanning_merge_reports_real_occupancy() {
+    // Reviewer finding 5. `propagate_merged_cells` only ever looked at
+    // rects spanning multiple ROWS, so a column-spanning merge was
+    // misreported: `is_own = true` with a one-column rect, despite the doc
+    // comment claiming "wider/taller" support.
+    //
+    // Fixture: a 3-column x 3-row grid of per-cell rects, plus ONE real
+    // extra rect spanning columns 0..2 across row 0 only (a genuine
+    // colspan header band), and ONE spanning rows 1..3 in column 0 (a
+    // genuine rowspan) so both directions are exercised in one table.
+    const COL_W: f32 = 80.0;
+    const ROW_H: f32 = 40.0;
+    const X0: f32 = 40.0;
+    const Y0: f32 = 300.0;
+
+    let mut content = String::from("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..3 {
+        for c in 0..3 {
+            let x = X0 + c as f32 * COL_W;
+            let y = Y0 + (2 - r) as f32 * ROW_H;
+            content.push_str(&format!("{} {} {} {} re f\n", x, y, COL_W, ROW_H));
+        }
+    }
+    // Colspan band over row 0, columns 0..=2.
+    content.push_str(&format!(
+        "{} {} {} {} re f\n",
+        X0,
+        Y0 + 2.0 * ROW_H,
+        3.0 * COL_W,
+        ROW_H
+    ));
+    // Rowspan band over column 0, rows 1..=2.
+    content.push_str(&format!("{} {} {} {} re f\n", X0, Y0, COL_W, 2.0 * ROW_H));
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    content.push_str(&format!(
+        "1 0 0 1 {} {} Tm (Span Header) Tj\n",
+        X0 + 6.0,
+        Y0 + 2.0 * ROW_H + 14.0
+    ));
+    for r in 1..3 {
+        for c in 0..3 {
+            let x = X0 + c as f32 * COL_W + 6.0;
+            let y = Y0 + (2 - r) as f32 * ROW_H + 14.0;
+            content.push_str(&format!("1 0 0 1 {} {} Tm (R{}C{}) Tj\n", x, y, r, c));
+        }
+    }
+    content.push_str("ET");
+    let pdf = make_text_pdf(&content, "0 0 400 792");
+
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let table = pages[0]
+        .tables
+        .iter()
+        .find(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .expect("the fixture's re-rect grid must be detected");
+    let occ = table
+        .cell_occupancy
+        .as_ref()
+        .expect("a Rects-source table must carry cell_occupancy");
+
+    // Locate the row holding the colspan header by its text, rather than
+    // assuming an index: grid row bands depend on the detector's edge
+    // snapping, not on the fixture's nominal rows.
+    let header_row = table
+        .cells
+        .iter()
+        .position(|row| row.iter().any(|c| c.contains("Span Header")))
+        .expect("header text must survive into a cell");
+
+    // Every column of the header band must report the WIDE rect, not its
+    // own single-column slot. This is the assertion that fails pre-fix.
+    let num_cols = table.cells[header_row].len();
+    assert!(num_cols >= 3, "expected >= 3 columns, got {}", num_cols);
+    for (c, cell) in occ[header_row].iter().enumerate().take(num_cols) {
+        assert!(
+            !cell.is_own,
+            "header-band col {} spans multiple columns and must report is_own=false",
+            c
+        );
+        let rect = cell
+            .rect
+            .expect("a column-spanning cell must carry the real covering rect");
+        assert!(
+            rect.width > COL_W * 1.5,
+            "header-band col {} must report the wide colspan rect (width ~{}), got {}",
+            c,
+            3.0 * COL_W,
+            rect.width
+        );
+    }
+
+    // And the rowspan in column 0 still reports a tall rect, so extending
+    // coverage horizontally did not regress the vertical case.
+    let data_rows: Vec<usize> = (0..table.cells.len())
+        .filter(|&r| r != header_row && !table.cells[r][0].trim().is_empty())
+        .collect();
+    assert!(
+        !data_rows.is_empty(),
+        "fixture must leave at least one non-empty column-0 data row"
+    );
+    for &r in &data_rows {
+        let cell = &occ[r][0];
+        assert!(
+            !cell.is_own,
+            "col 0 row {} is inside the rowspan band and must report is_own=false",
+            r
+        );
+        let rect = cell.rect.expect("rowspan cell must carry a covering rect");
+        assert!(
+            rect.height > ROW_H * 1.5,
+            "col 0 row {} must report the tall rowspan rect, got height {}",
+            r,
+            rect.height
+        );
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_image_placeholder_never_enters_heuristic_cells() {
+    // The other half of reviewer finding 4: image-placeholder and link
+    // items reaching the heuristic detector, where their synthesized text
+    // ("[Image: Im0]") can be swept into a table cell.
+    //
+    // HONESTY NOTE about what this test proves. The duplicate-table half of
+    // finding 4 is a confirmed, reproduced defect (see
+    // `test_page_geometry_mem_no_duplicate_table_and_no_placeholder_in_cells`,
+    // which fails without the claimed-item filter). This half is a GUARD,
+    // not a reproduction: with the filter removed, this fixture still does
+    // not leak, because the heuristic detector's small-font pass gates on
+    // `font_size >= 6.0` and an image placeholder carries no font size, so
+    // it is incidentally excluded today. That exclusion is a side effect of
+    // an unrelated threshold, not a rule -- `detect_heuristic.rs` has no
+    // item-type filter of its own (`is_heuristic_table_evidence` checks
+    // strikeout and redline regions only) -- so a body-font pass or a
+    // future threshold change reopens the path. Filtering at the call site,
+    // as the markdown pipeline effectively does, closes it by construction.
+    //
+    // Fixture: a borderless 3-column grid of plain text (no `re` rects, so
+    // the heuristic is the only detector that can fire) with an image
+    // XObject drawn on one of the grid's own text baselines.
+    const COLS: usize = 3;
+    const ROWS: usize = 6;
+    const COL_X: [f32; COLS] = [80.0, 240.0, 400.0];
+    const ROW_TOP: f32 = 700.0;
+    const ROW_H: f32 = 22.0;
+
+    let mut content = String::from("BT\n/F1 10 Tf\n");
+    for r in 0..ROWS {
+        let y = ROW_TOP - r as f32 * ROW_H;
+        for (c, x) in COL_X.iter().enumerate() {
+            content.push_str(&format!("1 0 0 1 {} {} Tm (Cell{}x{}) Tj\n", x, y, r, c));
+        }
+    }
+    content.push_str("ET\n");
+    // Image placed inside the grid's own y-range, between two text columns:
+    // exactly where a placeholder would be swept into a cell.
+    let img_y = ROW_TOP - 2.0 * ROW_H;
+    content.push_str(&format!(
+        "q\n40 0 0 12 {} {} cm /Im0 Do\nQ",
+        COL_X[1] + 60.0,
+        img_y
+    ));
+    let pdf = make_pdf_with_image_xobject(&content, "0 0 612 792");
+
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely exercise the path it targets.
+    assert!(
+        !pg.images.is_empty(),
+        "fixture must emit an image placeholder item"
+    );
+    let heuristic_tables: Vec<_> = pg
+        .tables
+        .iter()
+        .filter(|t| matches!(t.source, pdf_inspector::tables::TableSource::Heuristic))
+        .collect();
+    assert!(
+        !heuristic_tables.is_empty(),
+        "fixture must produce a heuristic-detected table; got sources {:?}",
+        pg.tables.iter().map(|t| t.source).collect::<Vec<_>>()
+    );
+
+    for table in &pg.tables {
+        for row in &table.cells {
+            for cell in row {
+                assert!(
+                    !cell.contains("[Image:"),
+                    "image placeholder leaked into a {:?} table cell: {:?}",
+                    table.source,
+                    cell
+                );
+            }
+        }
+        // And no table may claim the placeholder item by index either.
+        for &idx in &table.item_indices {
+            if let Some(item) = pg.text_items.get(idx) {
+                assert!(
+                    !item.text.starts_with("[Image:"),
+                    "table from {:?} claims image placeholder item {}",
+                    table.source,
+                    idx
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_real_document_shading_bands_are_not_merges() {
+    // Corpus-backed counterpart to the synthetic occupancy tests: a real
+    // document, read through the same entry point an FFI consumer uses.
+    //
+    // The defect this pins is a decorative band painted behind a row being
+    // recorded as merge evidence, so every cell of that row reports
+    // `is_own = false` pointing at ONE covering rect although the cells hold
+    // genuinely different text — a consumer filling down from that rect
+    // would discard text that was really there.
+    //
+    // Remove the merge-evidence gate and this fixture reports one such row;
+    // the 430-page `bits_pilani_feedback.pdf` reports 225 (kept out of the
+    // suite only because it takes two minutes to read). It must produce none.
+    let pdf =
+        std::fs::read("tests/fixtures/td9264.pdf").expect("corpus fixture should be readable");
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+
+    let mut checked_rows = 0usize;
+    for page in &pages {
+        for table in &page.tables {
+            let Some(occ) = table.cell_occupancy.as_ref() else {
+                continue;
+            };
+            for (r, row) in occ.iter().enumerate() {
+                if row.is_empty() || !row.iter().all(|c| !c.is_own) {
+                    continue;
+                }
+                checked_rows += 1;
+                let distinct: std::collections::HashSet<&str> = table.cells[r]
+                    .iter()
+                    .map(|c| c.trim())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                let first = row[0].rect;
+                let one_band = first.is_some_and(|f| {
+                    row.iter().all(|c| {
+                        c.rect.is_some_and(|x| {
+                            (x.x, x.y, x.width, x.height) == (f.x, f.y, f.width, f.height)
+                        })
+                    })
+                });
+                assert!(
+                    !(one_band && distinct.len() > 1),
+                    "page {} row {r}: cells {:?} all report the single covering rect {:?} \
+                     although they hold different text — a decorative band read as a merge",
+                    page.page,
+                    table.cells[r],
+                    first
+                );
+            }
+        }
+    }
+    assert!(
+        checked_rows > 0,
+        "fixture must exercise fully-covered rows, else the assertion never ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round-4 review: Image/Link items must not reach ANY detector, and occupancy
+// must not contradict the cell text it is reported alongside.
+// ---------------------------------------------------------------------------
+
+/// A fully-ruled 4x4 `re`-rect table, with an image XObject drawn ABOVE it and
+/// emitted FIRST in the content stream, and optionally a Link annotation
+/// covering cell R1C1.
+///
+/// The placement is the whole point. The pre-existing fixture
+/// (`make_rect_table_with_image_placeholder_pdf`) draws its image BELOW the
+/// table and last in the stream, so the image placeholder sorts after every
+/// table item and dropping it inside the detector shifts nothing. Drawn
+/// above/first, the placeholder is item 0 and every text index the detector
+/// reports is off by one unless it is mapped back.
+fn make_ruled_table_pdf_with_image_above(link_url: Option<&str>) -> Vec<u8> {
+    const COLS: usize = 4;
+    const ROWS: usize = 4;
+    const COL_W: f32 = 90.0;
+    const ROW_H: f32 = 40.0;
+    const X0: f32 = 50.0;
+    const Y0: f32 = 400.0;
+
+    // Image first, and above the table in page space.
+    let mut content = String::from("q\n200 0 0 60 60 600 cm /Im0 Do\nQ\n");
+    content.push_str("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+            content.push_str(&format!("{} {} {} {} re f\n", x, y, COL_W, ROW_H));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            let x = X0 + c as f32 * COL_W + 6.0;
+            let y = Y0 + (ROWS - 1 - r) as f32 * ROW_H + 14.0;
+            content.push_str(&format!("1 0 0 1 {} {} Tm (R{}C{}) Tj\n", x, y, r, c));
+        }
+    }
+    content.push_str("ET");
+
+    // Annotation rect over cell R1C1.
+    let annots = link_url.map(|url| {
+        let x = X0 + COL_W;
+        let y = Y0 + (ROWS - 1 - 1) as f32 * ROW_H;
+        format!(
+            "/Annots [<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] \
+             /Border [0 0 0] /A << /S /URI /URI ({}) >> >>]",
+            x,
+            y,
+            x + COL_W,
+            y + ROW_H,
+            url
+        )
+    });
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", annots.as_deref())
+}
+
+fn make_pdf_with_image_xobject_and_annots(
+    content: &str,
+    media_box: &str,
+    annots: Option<&str>,
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        &format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+             /Contents 4 0 R {} >>",
+            annots.unwrap_or("")
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(&mut pdf, &mut offsets, 5, HELVETICA_FONT);
+    let image_data = vec![0u8; 100];
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"6 0 obj\n");
+    pdf.extend_from_slice(
+        format!(
+            "<< /Type /XObject /Subtype /Image /Width 10 /Height 10 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /Length {} >>\nstream\n",
+            image_data.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&image_data);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in &offsets[1..] {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_offset
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn test_page_geometry_mem_image_above_table_keeps_item_indices_aligned() {
+    // Blocker A. `page_geometry_mem` handed its FULL item list to
+    // `detect_tables_from_rects`, which drops image placeholders internally
+    // without mapping the surviving indices back. With the image drawn above
+    // the table it is item 0, so every index the table reported pointed one
+    // item to the left of the text it meant — and the last cell was left
+    // unclaimed, free to be detected a second time by the heuristic pass.
+    let pdf = make_ruled_table_pdf_with_image_above(None);
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely place the image first, else this proves nothing.
+    assert!(
+        pg.text_items[0].text.starts_with("[Image:"),
+        "fixture must emit the image placeholder as item 0; got {:?}",
+        pg.text_items[0].text
+    );
+
+    let rect_tables: Vec<_> = pg
+        .tables
+        .iter()
+        .filter(|t| matches!(t.source, pdf_inspector::tables::TableSource::Rects))
+        .collect();
+    assert_eq!(
+        rect_tables.len(),
+        1,
+        "fixture must produce exactly one rect-detected table"
+    );
+    let table = rect_tables[0];
+
+    // Every reported index must name a real table text item, and the set must
+    // cover all 16 cells.
+    let mut named: Vec<String> = Vec::new();
+    for &idx in &table.item_indices {
+        let item = &pg.text_items[idx];
+        assert!(
+            !item.text.starts_with("[Image:"),
+            "item_indices points at the image placeholder (index {idx}) — \
+             the detector's internal image drop was never mapped back"
+        );
+        named.push(item.text.clone());
+    }
+    named.sort();
+    let mut expected: Vec<String> = (0..4)
+        .flat_map(|r| (0..4).map(move |c| format!("R{r}C{c}")))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        named, expected,
+        "the table's item_indices must name exactly its own 16 cell items"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_link_url_never_enters_a_rect_table_cell() {
+    // Blocker A, second half. Link items were filtered for the heuristic pass
+    // only, so a link annotation over a cell came back concatenated into that
+    // cell's text in a rect-detected table.
+    const URL: &str = "https://example.com/docs";
+    let pdf = make_ruled_table_pdf_with_image_above(Some(URL));
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    // The fixture must genuinely produce a link item over the cell.
+    assert!(
+        pg.text_items.iter().any(|i| i.text == URL),
+        "fixture must emit a link item carrying the URL"
+    );
+    assert!(
+        !pg.tables.is_empty(),
+        "fixture must produce at least one table"
+    );
+
+    for table in &pg.tables {
+        for row in &table.cells {
+            for cell in row {
+                assert!(
+                    !cell.contains("example.com"),
+                    "link URL leaked into a {:?} table cell: {:?}",
+                    table.source,
+                    cell
+                );
+            }
+        }
+    }
+}
+
+/// A 4-column x 12-row ruled table with a full-width decorative band painted
+/// over the top FOUR rows — the blocker-B repro.
+///
+/// Two of the dimensions are load-bearing and were found the hard way. The
+/// band must be at least 4x the height of a cell rect, or
+/// `detect_tables_from_rects`'s contained-sub-rect dedup deletes the covered
+/// cells as cell-internal decoration; the row boundary between them then
+/// never becomes a grid edge, the grid comes back one row short, and the
+/// concatenated text is a property of item assignment rather than of the
+/// fold, which is a different (and honest) situation. And the band must span
+/// at most half the grid's rows, or `decorative_fill_rects` stops calling it
+/// decoration and the two paths happen to agree by luck rather than by
+/// construction.
+fn make_banded_table_pdf() -> Vec<u8> {
+    const COLS: usize = 4;
+    const ROWS: usize = 12;
+    const BAND_ROWS: usize = 4;
+    const COL_W: f32 = 90.0;
+    const ROW_H: f32 = 30.0;
+    const X0: f32 = 50.0;
+    const Y0: f32 = 200.0;
+    let row_y = |r: usize| Y0 + (ROWS - 1 - r) as f32 * ROW_H;
+
+    let mut content = String::from("q\n0.9 0.9 0.9 rg\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "{} {} {} {} re f\n",
+                X0 + c as f32 * COL_W,
+                row_y(r),
+                COL_W,
+                ROW_H
+            ));
+        }
+    }
+    // The band: full table width, over the top `BAND_ROWS` rows.
+    content.push_str(&format!(
+        "0.8 0.8 0.8 rg\n{} {} {} {} re f\n",
+        X0,
+        row_y(BAND_ROWS - 1),
+        COL_W * COLS as f32,
+        ROW_H * BAND_ROWS as f32
+    ));
+    content.push_str("Q\nBT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (r{}c{}) Tj\n",
+                X0 + c as f32 * COL_W + 6.0,
+                row_y(r) + 10.0,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+#[test]
+fn test_page_geometry_mem_occupancy_never_contradicts_cell_text() {
+    // Blocker B. Occupancy was computed from `non_merge_evidence_rects` while
+    // the text fold ran off `skip_rects` alone, so the two could reach
+    // opposite conclusions about the same rect: the band below folded rows 0
+    // and 1 into `"r0c0 r1c0"` while occupancy reported `is_own = true` with a
+    // one-slot rect for the very cell whose text had just been moved.
+    //
+    // The assertion is the AGREEMENT, not either outcome. Which way a given
+    // rect is decided is the fold policy's business (and PR #2 changes it);
+    // that occupancy reports what the fold actually did is this PR's.
+    let pdf = make_banded_table_pdf();
+    let pages = page_geometry_mem(&pdf).expect("geometry extraction should succeed");
+    let pg = &pages[0];
+
+    let table = pg
+        .tables
+        .iter()
+        .find(|t| {
+            matches!(t.source, pdf_inspector::tables::TableSource::Rects)
+                && t.cell_occupancy.is_some()
+        })
+        .expect("fixture must produce a rect-detected table carrying occupancy");
+    let occupancy = table.cell_occupancy.as_ref().unwrap();
+    assert!(
+        table.cells.len() >= 3 && table.cells[0].len() >= 2,
+        "fixture must produce a multi-row, multi-column grid; got {}x{}",
+        table.cells.len(),
+        table.cells.first().map_or(0, |r| r.len())
+    );
+
+    // A cell that was folded INTO another cell is emptied by the fold. Any
+    // cell reported as `is_own` while its column's text was consolidated
+    // elsewhere is the contradiction this test exists for. Detect a fold
+    // structurally: a cell holding two of the fixture's distinct labels.
+    let mut checked = 0;
+    for (r, row) in table.cells.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            let labels = cell
+                .split_whitespace()
+                .filter(|t| t.starts_with('r'))
+                .count();
+            if labels <= 1 {
+                continue;
+            }
+            checked += 1;
+            // This cell absorbed another row's text, so the position is NOT
+            // its own one-slot cell and occupancy must say so.
+            assert!(
+                !occupancy[r][c].is_own,
+                "cell ({r},{c}) holds folded text {:?} but occupancy claims \
+                 is_own = true — the two disagree about the same rect",
+                cell
+            );
+            let rect = occupancy[r][c].rect.expect("covering rect is reported");
+            assert!(
+                rect.height > (table.rows[0] - table.rows[1]).abs(),
+                "the reported covering rect must be the multi-row merge geometry"
+            );
+        }
+    }
+    // If nothing folded, the contradiction direction is the other one — no
+    // cell anywhere may claim a merge it cannot show.
+    if checked == 0 {
+        for (r, row) in occupancy.iter().enumerate() {
+            for (c, occ) in row.iter().enumerate() {
+                assert!(
+                    occ.is_own,
+                    "nothing was folded, yet cell ({r},{c}) reports a merge"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_is_deterministic_and_ignores_image_font_size() {
+    // Blocker C. `base_font_size` was an ad-hoc frequency count over ALL
+    // items — image placeholders and link items included, whose font_size is
+    // 0.0 — with ties broken by `HashMap` iteration order, so the same bytes
+    // could yield different heuristic tables between runs in one process.
+    let pdf = make_ruled_table_pdf_with_image_above(Some("https://example.com/docs"));
+
+    let render = |pages: &[pdf_inspector::PageGeometry]| -> String {
+        pages
+            .iter()
+            .map(|p| {
+                p.tables
+                    .iter()
+                    .map(|t| format!("{:?}{:?}{:?}", t.source, t.item_indices, t.cells))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect::<Vec<_>>()
+            .join("#")
+    };
+
+    let first = render(&page_geometry_mem(&pdf).expect("extraction should succeed"));
+    for run in 1..8 {
+        let again = render(&page_geometry_mem(&pdf).expect("extraction should succeed"));
+        assert_eq!(again, first, "geometry output differed on run {run}");
+    }
+    assert!(!first.is_empty(), "fixture must detect at least one table");
+}
+
+/// A text-only (no `re` rects) 3x4 grid that only the heuristic text-density
+/// detector can find, on a page carrying `image_count` image placeholders.
+fn make_heuristic_table_pdf_with_images(image_count: usize) -> Vec<u8> {
+    const COLS: usize = 3;
+    const ROWS: usize = 4;
+    const COL_W: f32 = 120.0;
+    const ROW_H: f32 = 20.0;
+    const X0: f32 = 60.0;
+    const Y0: f32 = 500.0;
+
+    let mut content = String::new();
+    for i in 0..image_count {
+        content.push_str(&format!(
+            "q\n40 0 0 20 {} {} cm /Im0 Do\nQ\n",
+            60.0 + (i % 8) as f32 * 45.0,
+            660.0 + (i / 8) as f32 * 25.0
+        ));
+    }
+    content.push_str("BT\n/F1 9 Tf\n");
+    for r in 0..ROWS {
+        for c in 0..COLS {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
+                X0 + c as f32 * COL_W,
+                Y0 - r as f32 * ROW_H,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// A text-only 4-row key/value table — label column plus three numeric
+/// columns — with labels at `label_pt` and values at `value_pt`. Nothing else
+/// is on the page, so at small type the page has no body-sized text at all to
+/// compute a base font size from.
+fn make_small_type_key_value_pdf(label_pt: f32, value_pt: f32) -> Vec<u8> {
+    const COL_X: [f32; 4] = [60.0, 220.0, 340.0, 460.0];
+    const ROW_H: f32 = 20.0;
+    const Y0: f32 = 500.0;
+
+    let labels = ["Revenue", "Cost of sales", "Gross margin", "Net income"];
+    let values = [
+        ["12,481", "11,904", "10,552"],
+        ["9,033", "8,771", "8,140"],
+        ["3,448", "3,133", "2,412"],
+        ["1,207", "1,014", "876"],
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n");
+    for (r, label) in labels.iter().enumerate() {
+        let y = Y0 - r as f32 * ROW_H;
+        content.push_str(&format!(
+            "/F1 {label_pt} Tf\n1 0 0 1 {} {y} Tm ({label}) Tj\n",
+            COL_X[0]
+        ));
+        for (c, value) in values[r].iter().enumerate() {
+            content.push_str(&format!(
+                "/F1 {value_pt} Tf\n1 0 0 1 {} {y} Tm ({value}) Tj\n",
+                COL_X[c + 1]
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// A small-type (7pt label / 6pt value) key/value table with an ordinary
+/// small-type PROSE paragraph above it on the SAME page — the shape that
+/// stresses `detect_small_type_tables` differently from
+/// `make_small_type_key_value_pdf`: the page is no longer table-only, so a
+/// candidate base that is too permissive could pull prose lines into a
+/// table region (`has_table_like_content`'s row-gap grouping does not know
+/// "prose" from "table" except by shape), and a base that is too strict
+/// could still lose the table's own minority size the same way the
+/// label/value fixture above does. Both the table's completeness AND the
+/// prose's exclusion from every cell are asserted.
+fn make_small_type_table_with_prose_pdf(label_pt: f32, value_pt: f32) -> Vec<u8> {
+    const PROSE_X: f32 = 60.0;
+    const PROSE_ROW_H: f32 = 11.0;
+    const PROSE_Y0: f32 = 700.0;
+    const PROSE_FONT: f32 = 7.0;
+    const PROSE_LINES: [&str; 6] = [
+        "This section summarizes quarterly results for the reporting",
+        "period, covering revenue recognition, cost allocation, and",
+        "the resulting margin trends across each business segment for",
+        "the fiscal year, with commentary on the drivers behind the",
+        "period-over-period movement observed in the table that",
+        "follows immediately below this paragraph.",
+    ];
+
+    const COL_X: [f32; 4] = [60.0, 220.0, 340.0, 460.0];
+    const ROW_H: f32 = 20.0;
+    const TABLE_Y0: f32 = 500.0;
+
+    let labels = ["Revenue", "Cost of sales", "Gross margin", "Net income"];
+    let values = [
+        ["12,481", "11,904", "10,552"],
+        ["9,033", "8,771", "8,140"],
+        ["3,448", "3,133", "2,412"],
+        ["1,207", "1,014", "876"],
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n");
+    content.push_str(&format!("/F1 {PROSE_FONT} Tf\n"));
+    for (i, line) in PROSE_LINES.iter().enumerate() {
+        let y = PROSE_Y0 - i as f32 * PROSE_ROW_H;
+        content.push_str(&format!("1 0 0 1 {PROSE_X} {y} Tm ({line}) Tj\n"));
+    }
+    for (r, label) in labels.iter().enumerate() {
+        let y = TABLE_Y0 - r as f32 * ROW_H;
+        content.push_str(&format!(
+            "/F1 {label_pt} Tf\n1 0 0 1 {} {y} Tm ({label}) Tj\n",
+            COL_X[0]
+        ));
+        for (c, value) in values[r].iter().enumerate() {
+            content.push_str(&format!(
+                "/F1 {value_pt} Tf\n1 0 0 1 {} {y} Tm ({value}) Tj\n",
+                COL_X[c + 1]
+            ));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// A uniform 7pt, 3x3 numeric table whose rows are spaced 35pt apart — wider
+/// than pass 1's fixed 30pt row-gap threshold (`find_table_regions`), so at
+/// the OLD fixed-12.0 fallback this page finds NO table at all (not just an
+/// incomplete one): pass 1 splits every row into its own undersized region,
+/// and 12.0 never reaches pass 2's adaptive median-gap×3 grouping
+/// (`find_table_regions_strict`), which handles this spacing correctly.
+fn make_wide_row_spacing_small_type_pdf() -> Vec<u8> {
+    const COL_X: [f32; 3] = [60.0, 200.0, 340.0];
+    const ROW_H: f32 = 35.0;
+    const Y0: f32 = 600.0;
+
+    let mut content = String::new();
+    content.push_str("BT\n/F1 7 Tf\n");
+    for r in 0..3usize {
+        let y = Y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let value = 100 + r * 37 + c * 11;
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({value}) Tj\n"));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// End-to-end guard, through the whole `page_geometry_mem` path, that
+/// disabling the small-type fix entirely is detectable: at the OLD
+/// fixed-12.0 fallback this fixture finds ZERO tables, not merely an
+/// incomplete one (pass 1's fixed 30pt row-gap threshold splits every 35pt
+/// -spaced row into its own undersized region), so if a future edit routes
+/// small-type pages back through `page_geometry_mem`'s non-small-type branch
+/// (a bare `detect_tables(&unclaimed_items, base_font_size, false)` call)
+/// this test fails outright rather than merely losing a few cells.
+///
+/// Verified by mutation: temporarily forcing `page_geometry_mem` to always
+/// take its non-small-type branch (`is_small_type_page` short-circuited to
+/// `false`) makes this test fail (0 tables found). This mutation is NOT
+/// caught by `test_page_geometry_mem_finds_a_small_type_table` below —
+/// its 8pt/7pt fixture already found a (correct) result at the old fixed
+/// 12.0 fallback too, so that test alone cannot tell "the fix is disabled"
+/// from "the fix is working"; this fixture's whole point is a shape 12.0
+/// finds nothing on at all.
+#[test]
+fn test_page_geometry_mem_small_type_wide_row_spacing_needs_the_fix() {
+    let pages = page_geometry_mem(&make_wide_row_spacing_small_type_pdf())
+        .expect("extraction should succeed");
+    let tables = &pages[0].tables;
+    assert!(
+        !tables.is_empty(),
+        "a 7pt table with 35pt row spacing must be found through the whole \
+         page_geometry_mem path — if this now returns zero tables, the \
+         small-type fix has regressed to the old fixed-12.0-only behavior"
+    );
+    let non_empty_cells: usize = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    assert_eq!(
+        non_empty_cells, 9,
+        "all 9 cells of the 3x3 grid must survive, got {tables:?}"
+    );
+}
+
+/// Two independent unruled 7pt small-type tables stacked on one page, 35pt
+/// apart, 20pt row pitch, 4 rows x 3 cols each — table A numeric, table B
+/// text — the round-4 review's B1 repro shape, built directly as raw PDF
+/// content rather than through the unit-test `TextItem` helpers so this
+/// exercises the real `page_geometry_mem` extraction path end to end, not
+/// just the table-detection function in isolation.
+fn make_two_stacked_small_type_tables_pdf() -> Vec<u8> {
+    const COL_X: [f32; 3] = [60.0, 200.0, 340.0];
+    const ROW_H: f32 = 20.0;
+    const GAP: f32 = 35.0;
+    const Y0: f32 = 700.0;
+    const WORDS: [&str; 12] = [
+        "Approved",
+        "Pending",
+        "Rejected",
+        "Closed",
+        "Draft",
+        "Active",
+        "On hold",
+        "Expired",
+        "Review",
+        "Filed",
+        "Open",
+        "Escalated",
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n/F1 7 Tf\n");
+    // Table A: numeric, 4 rows x 3 cols.
+    for r in 0..4usize {
+        let y = Y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let value = 100 + r * 37 + c * 11;
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({value}) Tj\n"));
+        }
+    }
+    // Table B: text, 4 rows x 3 cols, GAP points below table A's last row.
+    let table_a_last_y = Y0 - 3.0 * ROW_H;
+    let table_b_y0 = table_a_last_y - GAP;
+    for r in 0..4usize {
+        let y = table_b_y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let word = WORDS[(r * 3 + c) % WORDS.len()];
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({word}) Tj\n"));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// End-to-end guard for round-4 review case B1/B3, through the whole
+/// `page_geometry_mem` path (not just `detect_small_type_tables` in
+/// isolation): two independent small-type tables 35pt apart must come back
+/// as two separate 4x3 tables, never fused into one 8x3 table.
+///
+/// This fails without this round's fix: at `5449e57` (before the B1
+/// reorder + B3 `fuses_a_baseline_table` structural check), the
+/// pass-2-only candidate's adaptive row-gap grouping window (median gap x
+/// 3) swallows the 35pt cross-table gap and returns one fused 8x3 table
+/// instead.
+#[test]
+fn test_page_geometry_mem_two_stacked_small_type_tables_stay_separate() {
+    let pages = page_geometry_mem(&make_two_stacked_small_type_tables_pdf())
+        .expect("extraction should succeed");
+    let tables = &pages[0].tables;
+    assert_eq!(
+        tables.len(),
+        2,
+        "two independent small-type tables 35pt apart must come back as \
+         two tables, not fused into one, got {tables:?}"
+    );
+    for t in tables {
+        assert_eq!(
+            t.rows.len(),
+            4,
+            "each table must keep its own 4 rows, not gain the other \
+             table's rows, got {tables:?}"
+        );
+        let non_empty_cells: usize = t
+            .cells
+            .iter()
+            .flatten()
+            .filter(|c| !c.trim().is_empty())
+            .count();
+        assert_eq!(
+            non_empty_cells, 12,
+            "each 4x3 table must keep all 12 of its own cells, got {tables:?}"
+        );
+    }
+}
+
+#[test]
+fn test_page_geometry_mem_finds_a_small_type_table() {
+    // End-to-end guard for the small-type case. `calculate_font_stats_from_items`
+    // ignores sizes under 9pt and answers 12.0 when nothing clears that
+    // floor — so a page set entirely in 7-8pt (financial and statistical
+    // tables, routinely) is detected with a base no item on the page
+    // matches. `page_geometry_mem` routes such a page through
+    // `tables::detect_small_type_tables` instead (`lib.rs`), which tries
+    // several page-derived candidate bases and keeps whichever recovers the
+    // most source items — specifically so a MIXED-size table (e.g. these
+    // 8pt labels beside 7pt values) does not lose a whole column to
+    // whichever pass its minority size falls outside of.
+    // `mixed_label_value_size_sweep_measures_completeness` and
+    // `mixed_size_repro_cases_from_round_4_review` in
+    // `tables::detect_heuristic` pin the arithmetic across many mixed-size
+    // configurations; this test pins the observable outcome through the
+    // whole geometry path, including that EVERY cell survives, not just
+    // that a table is found.
+    let small = page_geometry_mem(&make_small_type_key_value_pdf(8.0, 7.0))
+        .expect("extraction should succeed");
+    let cells = |pages: &[pdf_inspector::PageGeometry]| -> Vec<Vec<Vec<String>>> {
+        pages[0].tables.iter().map(|t| t.cells.clone()).collect()
+    };
+    let small_cells = cells(&small);
+    assert!(
+        !small_cells.is_empty(),
+        "a 4x2 key/value table set in 7-8pt must still be found"
+    );
+    assert!(
+        small_cells
+            .iter()
+            .any(|t| t.iter().flatten().any(|c| c.contains("12,481"))),
+        "the detected table must be the small-type grid, got {small_cells:?}"
+    );
+    // COMPLETENESS, not just presence: this fixture's labels (8pt) and
+    // values (7pt) are different sizes, exactly the case a most-common-size
+    // base drops the less-common size from. A prior round of this fix
+    // returned the value columns while silently losing the entire label
+    // column — worse than not finding the table, since the caller has no
+    // way to tell the result is incomplete. Every label and every value
+    // must survive.
+    let flat: Vec<&str> = small_cells
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|s| s.as_str())
+        .collect();
+    for label in ["Revenue", "Cost of sales", "Gross margin", "Net income"] {
+        assert!(
+            flat.iter().any(|c| c.contains(label)),
+            "label {label:?} must survive the 8pt/7pt mixed-size table, got {small_cells:?}"
+        );
+    }
+    for value in [
+        "12,481", "11,904", "10,552", "9,033", "8,771", "8,140", "3,448", "3,133", "2,412",
+        "1,207", "1,014", "876",
+    ] {
+        assert!(
+            flat.iter().any(|c| c.contains(value)),
+            "value {value:?} must survive the 8pt/7pt mixed-size table, got {small_cells:?}"
+        );
+    }
+
+    // The common case is unchanged: the same table at body size is found too,
+    // and the small-type page finds the same shape.
+    let normal = page_geometry_mem(&make_small_type_key_value_pdf(11.0, 10.0))
+        .expect("extraction should succeed");
+    let normal_cells = cells(&normal);
+    assert!(
+        !normal_cells.is_empty(),
+        "the ≥9pt control must still be found — the common case is unchanged"
+    );
+    assert_eq!(
+        small_cells.len(),
+        normal_cells.len(),
+        "small-type and body-size renderings of the same grid must agree on \
+         how many tables the page holds"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_base_font_size_ignores_image_placeholders() {
+    // Blocker C, the half that changes an answer rather than only stabilising
+    // it. `base_font_size` counted image and link items, whose `font_size` is
+    // 0.0, so on an image-heavy page the most common "size" was 0.0 and every
+    // font-size-relative threshold in the heuristic detector collapsed.
+    //
+    // Same text, twice: once on a page with no images and once on a page
+    // whose images outnumber its text items. The base size is a property of
+    // the TEXT, so the tables must be identical.
+    let without_images = page_geometry_mem(&make_heuristic_table_pdf_with_images(0))
+        .expect("extraction should succeed");
+    let with_images = page_geometry_mem(&make_heuristic_table_pdf_with_images(20))
+        .expect("extraction should succeed");
+
+    // The fixture must genuinely be image-dominated, else it proves nothing.
+    assert!(
+        with_images[0].images.len() > without_images[0].text_items.len(),
+        "fixture must be image-dominated: {} images vs {} text items",
+        with_images[0].images.len(),
+        without_images[0].text_items.len()
+    );
+
+    let cells = |pages: &[pdf_inspector::PageGeometry]| -> Vec<Vec<Vec<String>>> {
+        pages[0].tables.iter().map(|t| t.cells.clone()).collect()
+    };
+    assert!(
+        !cells(&without_images).is_empty(),
+        "fixture must detect a table when no images are present"
+    );
+    assert_eq!(
+        cells(&with_images),
+        cells(&without_images),
+        "adding image placeholders changed the detected tables — they are \
+         being counted toward the base font size"
+    );
+}
+
+#[test]
+fn test_page_geometry_mem_small_type_table_with_prose_on_same_page() {
+    // End-to-end guard combining two things the sweeps in
+    // `tables::detect_heuristic` cover separately: a mixed-size (8pt
+    // label / 7pt value) small-type table, AND ordinary small-type prose
+    // sharing the page with it. Two failure modes are checked at once:
+    //
+    // 1. Completeness must not regress vs. the OLD fixed-12.0 fallback —
+    //    every label and every value cell must survive, same as the
+    //    prose-free fixture above.
+    // 2. PRECISION: no word of the prose paragraph may appear inside any
+    //    detected table cell. A candidate base permissive enough to rescue
+    //    a table's minority font size is also more permissive about what
+    //    counts as a table row in the first place, so this is not implied
+    //    by (1) — a base could recover every table cell AND additionally
+    //    pull prose lines into a spurious row.
+    let pdf = make_small_type_table_with_prose_pdf(8.0, 7.0);
+    let pages = page_geometry_mem(&pdf).expect("extraction should succeed");
+    let tables = &pages[0].tables;
+
+    assert!(
+        !tables.is_empty(),
+        "the small-type table must still be found with prose on the same page"
+    );
+
+    let flat: Vec<&str> = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .map(|s| s.as_str())
+        .collect();
+
+    // Completeness: every label and every value cell survives, same set as
+    // `test_page_geometry_mem_finds_a_small_type_table`'s prose-free case.
+    for label in ["Revenue", "Cost of sales", "Gross margin", "Net income"] {
+        assert!(
+            flat.iter().any(|c| c.contains(label)),
+            "label {label:?} must survive with prose on the same page, got {tables:?}"
+        );
+    }
+    for value in [
+        "12,481", "11,904", "10,552", "9,033", "8,771", "8,140", "3,448", "3,133", "2,412",
+        "1,207", "1,014", "876",
+    ] {
+        assert!(
+            flat.iter().any(|c| c.contains(value)),
+            "value {value:?} must survive with prose on the same page, got {tables:?}"
+        );
+    }
+
+    // Precision: none of the prose paragraph's distinctive words leak into
+    // any table cell. Words chosen to be unique to the prose (not
+    // substrings of any label/value text above).
+    for word in [
+        "summarizes",
+        "quarterly",
+        "recognition",
+        "allocation",
+        "segment",
+        "commentary",
+        "period-over-period",
+        "paragraph",
+    ] {
+        assert!(
+            flat.iter().all(|c| !c.contains(word)),
+            "prose word {word:?} leaked into a detected table cell, got {tables:?}"
+        );
+    }
+
+    // Non-empty cell count is exactly the table's 16 (4 rows x 4 cols) —
+    // if it is higher, prose lines were folded into the table as extra
+    // rows/cells even though no single prose word tripped the substring
+    // check above (e.g. two prose words concatenated into one cell).
+    let non_empty_cells: usize = tables
+        .iter()
+        .flat_map(|t| t.cells.iter().flatten())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    assert_eq!(
+        non_empty_cells, 16,
+        "expected exactly the 4x4 table's 16 non-empty cells, got {tables:?}"
+    );
 }

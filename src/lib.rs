@@ -597,6 +597,391 @@ pub fn extract_pages_markdown_mem(
     .map(|extraction| extraction.result)
 }
 
+/// An image XObject placeholder's position and identity on a page.
+///
+/// Derived from the `ItemType::Image` `TextItem`s `extract_page_text_items`
+/// already emits (`extractor::content_stream`, `extractor::xobjects`) —
+/// there is no separate image-classification pass, so this reads the
+/// existing `[Image: <name>]` placeholder rather than adding one.
+#[derive(Debug, Clone)]
+pub struct ImageInfo {
+    pub xobject_name: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub page: u32,
+}
+
+/// Full per-page geometry: every signal `extract_page_text_items` and the
+/// table detectors already compute, exposed together for a caller that wants
+/// raw layout rather than the markdown pipeline's synthesized output.
+#[derive(Debug, Clone)]
+pub struct PageGeometry {
+    pub page: u32,
+    pub text_items: Vec<TextItem>,
+    pub lines: Vec<PdfLine>,
+    pub rects: Vec<PdfRect>,
+    pub images: Vec<ImageInfo>,
+    pub tables: Vec<tables::Table>,
+    /// How this page's coordinate frame was turned so predominantly rotated
+    /// text reads along +x (see [`PageRotation`]). `Upright` for an ordinary
+    /// page.
+    ///
+    /// Every coordinate in `text_items`, `rects`, `lines` and `tables`, and
+    /// every `TextItem::rotation`, is already expressed in the turned frame —
+    /// the crate's own `PositionFrame::Sheet`, what
+    /// [`extract_text_with_positions_mem`] returns. A consumer must NOT apply
+    /// this rotation again; it is reported so that a consumer pairing these
+    /// coordinates with page geometry of its own knows which frame they are
+    /// in, and can undo the turn if it wants raw page coordinates.
+    pub rotation: PageRotation,
+    /// The visible page box (`CropBox ∩ MediaBox`, else the MediaBox) in raw
+    /// PDF user space, normalized to `(x0, y0, x1, y1)`.
+    ///
+    /// This is the box the coordinates above are relative to: item geometry
+    /// is reported with the box's lower-left corner as origin, the frame a
+    /// renderer draws. `None` when the page declares no usable box, in which
+    /// case the crate falls back to US Letter.
+    ///
+    /// `/Rotate` is NOT applied, here or to the items — that is the `Sheet`
+    /// frame's definition. A consumer aligning with a rendered page image
+    /// wants [`PositionFrame::Display`] from the positioned-text APIs.
+    pub page_box: Option<(f32, f32, f32, f32)>,
+}
+
+/// Candidate base font sizes for an all-small-type page: everything on the
+/// page is below `calculate_font_stats_from_items`'s 9pt counting floor, so
+/// that helper has nothing to average and reports its own fixed 12.0
+/// fallback — a real regression for such pages (see
+/// `detect_small_type_tables`'s doc comment for why a single guessed base
+/// cannot be trusted, whichever formula produces it).
+///
+/// This returns a short, deterministically-ordered list of bases for
+/// `detect_small_type_tables` to try, not a single answer. **The old fixed
+/// 12.0 is listed FIRST** and `detect_small_type_tables` only replaces it on
+/// a STRICT item-count improvement (never on a tie) — two independent
+/// small-type tables separated by a gap can make several candidates recover
+/// the identical total item count while only one of them (the page-derived
+/// ones, via their adaptive row-gap grouping) actually fuses the two tables
+/// into one wrong table. Trying 12.0 first and requiring later candidates to
+/// strictly beat it, not merely match it, means a tie always keeps the
+/// structurally-correct fixed-12.0 result instead of preferring whichever
+/// fused candidate happened to be listed first.
+///
+/// 1. **The old fixed 12.0, listed FIRST.** `12.0 * 0.90 = 10.8` sits above
+///    any all-small-type page's max size by construction (this function is
+///    only ever called for a page where nothing reaches 9pt), so 12.0 always
+///    puts the WHOLE page through pass 1 together — the same guarantee the
+///    original fixed fallback gave, and never worse than what it already
+///    achieved. It goes first specifically so that `detect_small_type_tables`'s
+///    strict-improvement rule keeps it, rather than a later candidate, on
+///    any tie.
+/// 2. **A pass-2-only base**, when the page's size spread allows one. Pass 1
+///    (small-font, `detect_heuristic.rs`) admits `size <= base * 0.90` and
+///    runs FIRST, claiming whatever it finds before pass 2 (body-font,
+///    `base * 0.85 <= size <= base * 1.05`) ever sees it — so "both sizes
+///    fit inside pass 2's band" is not enough; pass 1 must be unable to
+///    claim EITHER size first, i.e. `min_size > base * 0.90`, or a
+///    mixed-size table gets split across passes and one side of it loses
+///    the 6-item minimum for its own pass. Combined with `max_size <=
+///    base * 1.05`, this is feasible only when the page's size spread is
+///    inside pass 2's own tolerance: `max_size / min_size < 1.05 / 0.90 ≈
+///    1.167`. Outside that ratio there is no base that keeps a mixed-size
+///    table together in pass 2 alone, and this candidate is omitted rather
+///    than returned anyway and silently losing data.
+/// 3. **A page-derived pass-1-only base** (`max_size / 0.90`, adjusted for
+///    `f32` rounding), the same "whole page through pass 1" guarantee as
+///    12.0 but derived from the page's own text rather than a constant —
+///    included as a second, page-scaled safety net alongside 12.0.
+///
+/// The margins on the divisors (`1.049` instead of `1.05`, `0.899` instead
+/// of `0.90`) exist because dividing and then re-multiplying by the exact
+/// same bound is precise in real-number math but not guaranteed in `f32`; a
+/// base that lands a hair on the wrong side of its own bound would exclude
+/// the very item that was supposed to set it.
+pub(crate) fn small_type_candidate_bases(items: &[TextItem]) -> Vec<f32> {
+    let mut min_size = f32::MAX;
+    let mut max_size = 0.0_f32;
+    for item in items {
+        if item.font_size > 0.0 {
+            min_size = min_size.min(item.font_size);
+            max_size = max_size.max(item.font_size);
+        }
+    }
+
+    if max_size <= 0.0 {
+        return vec![12.0];
+    }
+
+    let mut candidates = Vec::new();
+
+    // 12.0 goes FIRST: `detect_small_type_tables` only replaces the
+    // incumbent on a strict improvement, never a tie, so listing the
+    // structurally-safe fixed fallback first means a tie in recovered item
+    // count keeps 12.0's result instead of preferring whichever page-derived
+    // candidate happens to come later and may have fused two separate
+    // small-type tables into one via its adaptive row-gap grouping.
+    candidates.push(12.0);
+
+    let pass2_base = max_size / 1.049;
+    // Strict margin (`* 1.001`) so a size sitting exactly on pass 1's own
+    // boundary is never treated as "safely outside" it by a hair of `f32`
+    // rounding.
+    if min_size > pass2_base * 0.90 * 1.001 {
+        candidates.push(pass2_base);
+    }
+
+    candidates.push(max_size / 0.899);
+
+    candidates
+}
+
+/// Extract per-page geometry (text items, line segments, rects, image
+/// placeholders, and detected tables) from a PDF memory buffer.
+///
+/// Coordinates are in the same frame as the crate's public positioned-text
+/// APIs: the visible page box, `PositionFrame::Sheet` (see
+/// [`PageGeometry::rotation`] and [`PageGeometry::page_box`]).
+///
+/// This is a read-only geometry dump, not the markdown pipeline: it does not
+/// do band-scoping, chart-region exclusion, or structure-tree table detection
+/// (`detect_struct.rs`'s pass needs the document's tagged-PDF structure tree
+/// walked per region, which `process_pdf`'s pipeline does but this flat
+/// per-page pass does not attempt to replicate).
+///
+/// Tables come from the three page-scoped detectors that need only
+/// `(items, rects, page)` or `(items, lines, page)`, run in the markdown
+/// pipeline's own precedence: `detect_tables_from_rects`
+/// (`TableSource::Rects`) first, `detect_tables_from_lines`
+/// (`TableSource::Lines`) only when rects claimed nothing at all, and
+/// `detect_tables` (`TableSource::Heuristic`) only over items no structural
+/// detector claimed. Running the heuristic over *all* items would return the
+/// same physical table twice under two different sources.
+///
+/// KNOWN LIMITATION: there is no password parameter, so an encrypted PDF
+/// cannot be processed through this entry point. `process_pdf_with_options`
+/// takes `PdfOptions::password`; plumbing the same through here is a
+/// deliberate follow-up, not an oversight.
+pub fn page_geometry_mem(buffer: &[u8]) -> Result<Vec<PageGeometry>, PdfError> {
+    validate_pdf_bytes(buffer)?;
+    let (doc, page_count) = load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    // The visible-page-box extraction the public position APIs use, so this
+    // dump reports the same coordinates they do, with each page's frame turn
+    // already applied to items, rects, lines AND `TextItem::rotation`. There
+    // is deliberately no second rotation correction here: upstream's
+    // `PageRotation` rebases the per-item angle with the frame, and applying
+    // any further fixup would rotate the geometry a second time.
+    let ((all_items, all_rects, all_lines), _thresholds, _gid_pages, page_rotations, _coverage) =
+        extractor::extract_positioned_text_from_doc_in_page_box(
+            &doc,
+            &font_cmaps,
+            None,
+            PositionOptions::default(),
+        )?;
+
+    // Group once by page. Filtering the whole document's items/rects/lines
+    // inside the per-page loop was O(pages * total items).
+    let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
+    for item in all_items {
+        items_by_page.entry(item.page).or_default().push(item);
+    }
+    let mut rects_by_page: HashMap<u32, Vec<PdfRect>> = HashMap::new();
+    for rect in all_rects {
+        rects_by_page.entry(rect.page).or_default().push(rect);
+    }
+    let mut lines_by_page: HashMap<u32, Vec<PdfLine>> = HashMap::new();
+    for line in all_lines {
+        lines_by_page.entry(line.page).or_default().push(line);
+    }
+    let page_ids = doc.get_pages();
+
+    let mut out = Vec::with_capacity(page_count as usize);
+    for page in 1..=page_count {
+        let page_items: Vec<TextItem> = items_by_page.remove(&page).unwrap_or_default();
+        let page_rects: Vec<PdfRect> = rects_by_page.remove(&page).unwrap_or_default();
+        let page_lines: Vec<PdfLine> = lines_by_page.remove(&page).unwrap_or_default();
+
+        let rotation = page_rotations
+            .get(&page)
+            .copied()
+            .unwrap_or(PageRotation::Upright);
+        let page_box = page_ids
+            .get(&page)
+            .and_then(|&page_id| extractor::page_box::visible_page_box(&doc, page_id))
+            .map(|b| (b.x0, b.y0, b.x1, b.y1));
+
+        let images: Vec<ImageInfo> = page_items
+            .iter()
+            .filter(|i| matches!(i.item_type, extractor::ItemType::Image))
+            .map(|i| {
+                // Placeholders are formatted as "[Image: <name>]" by
+                // content_stream.rs/xobjects.rs; strip the wrapper to recover
+                // the XObject resource name.
+                let xobject_name = i
+                    .text
+                    .strip_prefix("[Image: ")
+                    .and_then(|s| s.strip_suffix(']'))
+                    .unwrap_or(&i.text)
+                    .to_string();
+                ImageInfo {
+                    xobject_name,
+                    x: i.x,
+                    y: i.y,
+                    width: i.width,
+                    height: i.height,
+                    page,
+                }
+            })
+            .collect();
+
+        // Image placeholders ("[Image: X]") and link annotations are
+        // synthesized markers, not page text. The markdown pipeline splits
+        // them off before ANY detector runs (`markdown/mod.rs`, the
+        // `ItemType::Image` / `ItemType::Link` arms), and this dump must do
+        // the same: an image bbox manufactures a spurious column edge, and a
+        // link's URL lands verbatim inside a detected cell's text.
+        //
+        // `detector_map[i]` is the index in `page_items` of `detector_items[i]`,
+        // so every `item_indices` a detector returns can be translated back to
+        // the full list this page reports as `text_items`.
+        let (detector_items, detector_map): (Vec<TextItem>, Vec<usize>) = page_items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                !matches!(
+                    item.item_type,
+                    extractor::ItemType::Image | extractor::ItemType::Link(_)
+                )
+            })
+            .map(|(idx, item)| (item.clone(), idx))
+            .unzip();
+
+        // Font statistics come from the same helper the markdown path uses.
+        // The ad-hoc frequency count this replaced had two defects: it counted
+        // Image/Link items (whose `font_size` is 0.0) toward the base, so an
+        // image-heavy page could report a base size of 0.0, and it broke ties
+        // via `HashMap` iteration order, making the heuristic tables a page
+        // reports differ between runs over identical bytes.
+        //
+        // `calculate_font_stats_from_items` only counts items >= 9pt, so an
+        // all-small-type page (nothing on it reaches 9pt) reports
+        // `total_lines == 0` and falls back to a fixed 12.0. That fallback
+        // is a real regression for such pages, not a safe default: at base
+        // 12.0 a 7-8pt page only ever reaches the small-font detection pass
+        // (`detect_heuristic.rs`'s pass 1), which is *stricter* than the
+        // body-font pass in two ways that matter — its content check rejects
+        // 2-column key/value tables with text (not numeric) values, and its
+        // fixed 30pt row-gap threshold (vs. pass 2's adaptive median-gap×3)
+        // misses tables with wider row spacing.
+        //
+        // For an all-small-type page, no SINGLE derived base is safe to
+        // trust blind — see `tables::detect_small_type_tables`'s doc
+        // comment for why a most-common-size base, and even a base chosen
+        // to fit the page's whole size range inside one detection pass, can
+        // each still silently drop cells on a MIXED-size table (e.g. 8pt
+        // labels beside 7pt values). Instead of picking one base and hoping,
+        // the small-type branch below tries several candidate bases and
+        // keeps whichever recovers the most source items — provably never
+        // worse than the old fixed-12.0 fallback, since 12.0 is always one
+        // of the candidates tried. `page_geometry_small_type_base_size_sweep`
+        // plus the mixed-size fixtures around it in
+        // `tables/detect_heuristic.rs` measure this against the old
+        // fixed-12.0 baseline.
+        let base_stats = markdown::analysis::calculate_font_stats_from_items(&detector_items);
+        let is_small_type_page = base_stats.total_lines == 0;
+        let base_font_size = base_stats.most_common_size;
+
+        let mut page_tables = Vec::new();
+        // Indices (into `page_items`) already claimed by a structural
+        // detector, so the heuristic pass cannot re-report the same table.
+        let mut claimed: HashSet<usize> = HashSet::new();
+
+        // Translate a detector's `item_indices` (into `detector_items`) back
+        // to `page_items` positions.
+        let remap = |table: &mut tables::Table| {
+            for idx in &mut table.item_indices {
+                if let Some(&original) = detector_map.get(*idx) {
+                    *idx = original;
+                }
+            }
+        };
+
+        let (mut rect_tables, _hints) =
+            tables::detect_tables_from_rects(&detector_items, &page_rects, page);
+        for table in &mut rect_tables {
+            remap(table);
+        }
+        // Line detection is skipped whenever the rect detector claimed
+        // anything at all — not merely when it found a *data* table. That is
+        // the markdown pipeline's own precedence: a rect-found TOC plus a
+        // line-found grid over the same items would otherwise report one
+        // physical table twice.
+        for table in &rect_tables {
+            claimed.extend(table.item_indices.iter().copied());
+        }
+        page_tables.extend(rect_tables);
+        let rects_claimed_something = !claimed.is_empty();
+
+        // Ruled-line grids (pure `l`-operator borders, no filled `re` rects)
+        // are missed entirely by the rect detector, so fall through to the
+        // line detector when rects found nothing.
+        if !rects_claimed_something {
+            let mut line_tables =
+                tables::detect_tables_from_lines(&detector_items, &page_lines, page);
+            for table in &mut line_tables {
+                remap(table);
+            }
+            for table in &line_tables {
+                claimed.extend(table.item_indices.iter().copied());
+            }
+            page_tables.extend(line_tables);
+        }
+
+        // Heuristic (text-density) detection, restricted to items no
+        // structural detector claimed. Image/link items are already absent
+        // from `detector_items`.
+        let (unclaimed_items, unclaimed_map): (Vec<TextItem>, Vec<usize>) = detector_items
+            .iter()
+            .zip(detector_map.iter())
+            .filter(|(_, &original)| !claimed.contains(&original))
+            .map(|(item, &original)| (item.clone(), original))
+            .unzip();
+        if !unclaimed_items.is_empty() {
+            let mut heuristic_tables = if is_small_type_page {
+                tables::detect_small_type_tables(&unclaimed_items)
+            } else {
+                tables::detect_tables(&unclaimed_items, base_font_size, false)
+            };
+            // `item_indices` come back indexed into `unclaimed_items`; map
+            // them back to `page_items` so a consumer can correlate a table
+            // with the `text_items` array it was handed.
+            for table in &mut heuristic_tables {
+                for idx in &mut table.item_indices {
+                    if let Some(&original) = unclaimed_map.get(*idx) {
+                        *idx = original;
+                    }
+                }
+            }
+            page_tables.extend(heuristic_tables);
+        }
+
+        out.push(PageGeometry {
+            page,
+            text_items: page_items,
+            lines: page_lines,
+            rects: page_rects,
+            images,
+            tables: page_tables,
+            rotation,
+            page_box,
+        });
+    }
+
+    Ok(out)
+}
+
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
 /// `render_repairs` asks for the repaired document to be written back out
 /// for the renderer when the loader changed it (see `form_bbox_repair`);

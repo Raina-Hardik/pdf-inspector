@@ -9,7 +9,7 @@ use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
     recover_header_row,
 };
-use super::{Table, TableDetectionMode};
+use super::{Table, TableDetectionMode, TableSource};
 
 /// PDF text is often emitted as one item per glyph. That produces
 /// hundreds of single-char items that confuse column detection. This function
@@ -546,6 +546,169 @@ impl<'a> ScriptBodyIndex<'a> {
 /// Detect tables in a set of text items from a single page
 pub fn detect_tables(items: &[TextItem], base_font_size: f32, skip_body_font: bool) -> Vec<Table> {
     detect_tables_with_page_width(items, base_font_size, skip_body_font, content_width(items))
+}
+
+/// Detect tables on an all-small-type page (everything below
+/// `calculate_font_stats_from_items`'s 9pt counting floor) by running
+/// `detect_tables` once per candidate base from
+/// `crate::small_type_candidate_bases` and keeping whichever run recovered
+/// the most source items (`Table::item_indices`, summed across every table
+/// that run found).
+///
+/// No single guessed base is safe to return blind, however it is derived —
+/// this was measured directly: a base picked from the page's most-common
+/// size (the original attempt at this fix) can put a table's minority size
+/// entirely out of range of both detection passes, silently dropping that
+/// column or row from an otherwise-found table; a base picked to keep the
+/// full size range inside pass 2 alone (the next attempt) can still lose
+/// data, because pass 1 runs FIRST and claims whatever satisfies its own
+/// admission band before pass 2 ever sees it, so a base that merely keeps
+/// every size inside pass 2's band does not stop pass 1 from skimming off
+/// part of the page first. Running every candidate and comparing actual
+/// recovered-item counts sidesteps needing either guess to be correct: it
+/// is provably never worse than the old fixed-12.0 fallback, because 12.0
+/// is always one of the candidates tried (`small_type_candidate_bases`),
+/// so the maximum over all candidates' scores can never be lower than
+/// 12.0's own score.
+///
+/// `small_type_candidate_bases` lists the old fixed 12.0 FIRST, and it is
+/// the one candidate this function never subjects to the fusion check
+/// below: 12.0 is always eligible, so the "never worse than the old
+/// fixed-12.0 fallback" guarantee cannot be broken by the structural check
+/// disqualifying it. Ties are therefore broken in 12.0's favor — a later
+/// page-derived candidate only replaces the incumbent on a STRICT
+/// item-count improvement, never a tie, which matters because two
+/// independent small-type tables separated by a page gap can make several
+/// candidates recover the identical total item count while only the
+/// page-derived ones (via their adaptive row-gap grouping) actually fuse
+/// the two tables into one wrong table (round-4 review, case B1).
+///
+/// A later candidate that DOES strictly beat the incumbent on item count
+/// must also pass `fuses_a_baseline_table` before it may replace it — a
+/// candidate that only wins by fusing two separate tables together is not
+/// really a richer result, it is corruption that happens to count more
+/// items (case B3: unlike B1's tie, the fused count here is a genuine,
+/// non-tied improvement, so reordering candidates alone cannot catch it).
+///
+/// An earlier version of this check compared a table's OWN row gaps against
+/// its OWN median (a fixed outlier-ratio threshold) — measurement against
+/// the reviewer's actual B3 shapes showed that threshold cannot separate a
+/// fused pair from a real table reliably: when the larger-pitch table of
+/// the fused pair has MORE rows than the smaller-pitch one, it dominates
+/// the fused table's own median, and the cross-table seam can land well
+/// under any ratio a legitimate header/blank-row gap would also need to
+/// clear (see `stacked_small_type_tables_with_unequal_pitch_are_not_fused`
+/// for the concrete case this was measured against). Comparing against the
+/// 12.0 baseline's OWN tables instead of a table's own internal spacing
+/// sidesteps that: the baseline is real ground truth for "where do row
+/// clusters actually break on this page" (see `fuses_a_baseline_table`).
+pub(crate) fn detect_small_type_tables(items: &[TextItem]) -> Vec<Table> {
+    let bases = crate::small_type_candidate_bases(items);
+    // bases[0] is always the 12.0 baseline (see
+    // `small_type_candidate_bases`'s doc comment) — computed once and used
+    // both as the initial incumbent and as the ground truth
+    // `fuses_a_baseline_table` checks later candidates against.
+    let baseline_tables = detect_tables(items, bases[0], false);
+    let baseline_score: usize = baseline_tables.iter().map(|t| t.item_indices.len()).sum();
+
+    let mut best = baseline_tables.clone();
+    let mut best_score = baseline_score;
+
+    for base in bases.into_iter().skip(1) {
+        let tables = detect_tables(items, base, false);
+        let score: usize = tables.iter().map(|t| t.item_indices.len()).sum();
+        if score > best_score && !fuses_a_baseline_table(&baseline_tables, &tables) {
+            best_score = score;
+            best = tables;
+        }
+    }
+
+    best
+}
+
+/// True if some table in `candidate` looks like it fuses a table the 12.0
+/// baseline already found intact (`baseline`) with material beyond a gap
+/// bigger than that baseline table ever tolerated internally.
+///
+/// Concretely: for a baseline table `B` with at least 2 rows (so it has a
+/// "typical" row gap to compare against) and a candidate table `T`, `T` is
+/// flagged if `T` has AT LEAST 2 MORE ROWS than `B`, `T`'s item set is a
+/// PROPER superset of `B`'s (so `T` claims to have found everything `B`
+/// found, plus more), and `T`'s largest row-to-row gap exceeds `B`'s own
+/// largest row-to-row gap. `B`'s max gap is real ground truth for how far
+/// apart two rows of the SAME table get on this page — the 12.0 base
+/// always pushes the whole small-type page through pass 1 as a unit, so
+/// whatever page-gap-vs-row-gap distinction exists on this page, `B`
+/// already reflects it. `T` claiming to have grown `B` by reaching across a
+/// gap `B` itself never crossed is exactly the fingerprint a fused pair of
+/// independent tables leaves.
+///
+/// The "at least 2 more rows" condition exists because a single extra row
+/// (typically a header or footer row `B` itself failed to cluster in, a
+/// real and legitimate gain) is indistinguishable from a fused pair by row
+/// count alone — measured directly via
+/// `row_gap_outlier_does_not_flag_legitimate_layouts`'s 2.5x header-gap
+/// case, which recovers exactly one extra row and was a false positive
+/// before this condition was added. A genuinely fused SECOND table always
+/// contributes more than one row of its own, so requiring 2+ extra rows
+/// keeps that case flagged while clearing single-row recoveries.
+///
+/// Comparing item SETS rather than counts requires `item_indices` to be
+/// comparable across different `base_font_size` calls for the same input
+/// `items` — true here because `merge_adjacent_items_preserving` and
+/// `expand_consolidated_items` (the two steps that renumber items) run
+/// before `base_font_size` is used for anything, so every call over the
+/// same `items` slice shares one index space.
+fn fuses_a_baseline_table(baseline: &[Table], candidate: &[Table]) -> bool {
+    use std::collections::HashSet;
+
+    for b in baseline {
+        if b.rows.len() < 2 {
+            continue; // no internal row gap to compare against
+        }
+        let b_max_gap = b
+            .rows
+            .windows(2)
+            .map(|w| (w[0] - w[1]).abs())
+            .fold(0.0_f32, f32::max);
+        let b_set: HashSet<usize> = b.item_indices.iter().copied().collect();
+
+        for t in candidate {
+            if t.item_indices.len() <= b.item_indices.len() {
+                continue; // not a proper superset by count; cheap pre-filter
+            }
+            // Measured false positive (round-5 review of this fix): a
+            // legitimate config where the 12.0 baseline itself drops ONE
+            // extra row (e.g. a header row a page-derived candidate's
+            // adaptive grouping correctly recovers) looks identical to a
+            // fusion by the raw "bigger gap, superset item set" test alone
+            // — `row_gap_outlier_does_not_flag_legitimate_layouts`'s 2.5x
+            // header-gap case grows the baseline's 5-row table to 6 rows
+            // via one recovered header row, which is real data, not a
+            // fused second table. Require the candidate to add at least 2
+            // rows beyond the baseline table before treating a larger max
+            // gap as suspicious — a genuinely fused SECOND table always
+            // contributes its own multiple rows, while a single recovered
+            // row (header, footer, or an isolated stray line) never does.
+            if t.rows.len() < b.rows.len() + 2 {
+                continue;
+            }
+            let t_set: HashSet<usize> = t.item_indices.iter().copied().collect();
+            if !b_set.is_subset(&t_set) {
+                continue;
+            }
+            let t_max_gap = t
+                .rows
+                .windows(2)
+                .map(|w| (w[0] - w[1]).abs())
+                .fold(0.0_f32, f32::max);
+            if t_max_gap > b_max_gap {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Detect tables in a subset while using the full page's text width for
@@ -1303,7 +1466,13 @@ fn detect_contents_list(items: &[(usize, &TextItem)]) -> Option<Table> {
     }
     number_x.sort_by(|a, b| a.total_cmp(b));
     let columns = vec![title_x, number_x[number_x.len() / 2]];
-    let table = Table::new(columns, rows[first..=last].to_vec(), cells, item_indices);
+    let table = Table::with_source(
+        columns,
+        rows[first..=last].to_vec(),
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    );
     if table.kind != super::TableKind::Toc {
         debug!(
             "  contents list rejected: {} rows do not classify as a contents table",
@@ -1587,7 +1756,13 @@ fn detect_table_in_region(
         item_indices.len()
     );
 
-    Some(Table::new(columns, rows, cells, item_indices))
+    Some(Table::with_source(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Heuristic,
+    ))
 }
 
 /// Check if this looks like a key-value pair layout rather than a table
@@ -2997,6 +3172,1030 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    /// A small-type page's base font size decides which of the two heuristic
+    /// passes each item can enter. Two mechanisms make this trickier than a
+    /// single per-item range check:
+    ///
+    /// 1. **Pass 1 (small-font, `size <= base * 0.90`, `>= 6.0`) runs FIRST**
+    ///    and claims whatever it finds before pass 2 (body-font,
+    ///    `base * 0.85 <= size <= base * 1.05`) ever sees the rest of the
+    ///    page. So a base that merely keeps every item's SIZE inside pass 2's
+    ///    band is not enough — if a subset of those sizes also clears pass
+    ///    1's own admission band, pass 1 claims that subset first, and it is
+    ///    gone from pass 2's candidate pool.
+    /// 2. **Each pass needs at least 6 items of its own**
+    ///    (`table_candidates.len() >= 6` / `body_candidates.len() >= 6`) to
+    ///    run at all. A mixed-size table whose two sizes end up split across
+    ///    the two passes can put BOTH passes under that floor even though
+    ///    every item, individually, has a pass it qualifies for.
+    ///
+    /// A mode-derived base demonstrates (2) directly: on a page mixing 7pt
+    /// values and 8pt labels, a mode of 7.0 puts the 8pt labels above
+    /// `7.0 * 1.05 = 7.35` — excluded from pass 2 outright, and (if there are
+    /// too few of them alone) from ever reaching the 6-item floor for any
+    /// pass. No tie-break direction fixes this, because 8.0 was never the
+    /// tied value to begin with; the whole approach of deriving a single
+    /// base from a central tendency (mode, or a max/1.05-only "upper bound"
+    /// that pass 1 can still skim from) is what `detect_small_type_tables`
+    /// (`tables/detect_heuristic.rs`) replaces — see its own doc comment for
+    /// why trying several candidate bases and keeping the best-scoring
+    /// result is the actual fix, not a smarter single-base formula.
+    ///
+    /// This test pins the specific mode-based failure a past round of this
+    /// fix reintroduced, scoped to `detect_tables`'s own thresholds so a
+    /// future edit that goes back to deriving one base from the mode does
+    /// not re-break it without a test noticing.
+    #[test]
+    fn mixed_size_grid_loses_labels_at_a_mode_derived_base() {
+        let labels = [
+            "Total revenue, net of allowances",
+            "Cost of sales and related expense",
+            "Gross margin before tax provision",
+            "Net income attributable to parent",
+        ];
+        let values = ["12,481.55", "9,033.10", "3,448.45", "1,207.02"];
+        let grid = |label_pt: f32, value_pt: f32| -> Vec<TextItem> {
+            let mut items = Vec::new();
+            for (r, label) in labels.iter().enumerate() {
+                let y = 500.0 - r as f32 * 14.0;
+                items.push(make_item(
+                    label,
+                    60.0,
+                    y,
+                    label_pt,
+                    label.len() as f32 * label_pt * 0.5,
+                ));
+                items.push(make_item(values[r], 300.0, y, value_pt, 40.0));
+            }
+            items
+        };
+
+        // Entirely 7-8pt, the shape small-type financial tables take.
+        let mixed = grid(8.0, 7.0);
+        let uniform = grid(7.6, 7.6);
+
+        // The 12.0 fallback is above every item's floor, and finds both.
+        assert_eq!(detect_tables(&mixed, 12.0, false).len(), 1);
+        assert_eq!(detect_tables(&uniform, 12.0, false).len(), 1);
+
+        // A mode-of-7.0 base puts the 8pt labels ABOVE pass 1's own
+        // admission ceiling (`7.0 * 0.90 = 6.3`), so pass 1 can't claim them
+        // either, and they're also above pass 2's `7.0 * 1.05 = 7.35` band.
+        // With nowhere to land, and only 4 label items on this page — under
+        // the 6-item minimum for a pass of their own — nothing is found. It
+        // is this item-count gate that empties the result, not the labels
+        // sitting below any floor.
+        assert_eq!(
+            detect_tables(&mixed, 7.0, false).len(),
+            0,
+            "if this now finds the (complete) table, the mode-based dead \
+             zone has moved — re-measure before changing this assertion"
+        );
+        assert_eq!(detect_tables(&uniform, 7.6, false).len(), 1);
+
+        // `detect_small_type_tables` — the actual production entry point,
+        // NOT a single derived base — finds the whole mixed grid intact by
+        // trying several candidates and keeping the best-scoring result.
+        assert_eq!(
+            detect_small_type_tables(&mixed).len(),
+            1,
+            "detect_small_type_tables must find the mixed 7pt/8pt grid"
+        );
+    }
+
+    /// Build a uniform-font-size, `rows` x `cols` grid of table-shaped
+    /// items, one row per `row_spacing` points of Y. `textual` selects
+    /// short prose-like cell values (exercising `has_table_like_content`'s
+    /// content check) instead of numeric ones.
+    fn small_type_grid_items(
+        font_size: f32,
+        rows: usize,
+        cols: usize,
+        row_spacing: f32,
+        textual: bool,
+    ) -> Vec<TextItem> {
+        const WORDS: &[&str] = &[
+            "Approved",
+            "Pending",
+            "Rejected",
+            "Closed",
+            "Draft",
+            "Active",
+            "On hold",
+            "Expired",
+            "Review",
+            "Filed",
+            "Open",
+            "Escalated",
+        ];
+        let mut items = Vec::new();
+        for r in 0..rows {
+            let y = 500.0 - r as f32 * row_spacing;
+            for c in 0..cols {
+                let x = 60.0 + c as f32 * 120.0;
+                let text = if textual {
+                    WORDS[(r * cols + c) % WORDS.len()].to_string()
+                } else {
+                    format!("{}", 100 + r * 37 + c * 11)
+                };
+                let width = text.len() as f32 * font_size * 0.5;
+                items.push(make_item(&text, x, y, font_size, width));
+            }
+        }
+        items
+    }
+
+    /// A single-column prose page at a small uniform size: `lines` short
+    /// sentences, one per `line_spacing` points of Y, meant to find zero
+    /// tables regardless of base.
+    fn small_type_prose_items(font_size: f32, lines: usize, line_spacing: f32) -> Vec<TextItem> {
+        (0..lines)
+            .map(|i| {
+                let y = 500.0 - i as f32 * line_spacing;
+                let text = format!(
+                    "This is paragraph line number {i} of running prose text, not a table."
+                );
+                make_item(
+                    &text,
+                    60.0,
+                    y,
+                    font_size,
+                    text.len() as f32 * font_size * 0.5,
+                )
+            })
+            .collect()
+    }
+
+    /// Two independent uniform-size small-type grids, `gap` points apart,
+    /// concatenated into one page's items — the round-4 review's B1/B3
+    /// repro shape: two unrelated small-type tables stacked on one page
+    /// with a real page gap between them, which a page-derived candidate's
+    /// adaptive row-gap grouping can incorrectly swallow into one table.
+    fn stacked_small_type_tables_items(
+        font_size: f32,
+        rows: usize,
+        cols: usize,
+        row_spacing: f32,
+        gap: f32,
+        textual: bool,
+    ) -> Vec<TextItem> {
+        let table_a = small_type_grid_items(font_size, rows, cols, row_spacing, textual);
+        let last_a_y = 500.0 - (rows - 1) as f32 * row_spacing;
+        let start_b_y = last_a_y - gap;
+        let shift = 500.0 - start_b_y;
+        let mut table_b = small_type_grid_items(font_size, rows, cols, row_spacing, !textual);
+        for item in &mut table_b {
+            item.y -= shift;
+        }
+        let mut items = table_a;
+        items.extend(table_b);
+        items
+    }
+
+    /// Case B1 from the round-4 review: two separate 4x3 7pt tables, 35pt
+    /// apart, 20pt row pitch. Several `small_type_candidate_bases`
+    /// candidates recover the identical total item count (24) here — the
+    /// old head kept the FIRST-listed one on that tie, and the pass-2-only
+    /// candidate was listed first and fuses the two tables via its
+    /// adaptive row-gap grouping. Listing 12.0 first and requiring a
+    /// STRICT improvement to replace it (this round's B1 fix) is enough by
+    /// itself to keep this case correct.
+    #[test]
+    fn stacked_small_type_tables_are_not_fused_on_a_tie() {
+        let items = stacked_small_type_tables_items(7.0, 4, 3, 20.0, 35.0, false);
+        let found = detect_small_type_tables(&items);
+        assert_eq!(
+            found.len(),
+            2,
+            "two independent small-type tables 35pt apart must stay two \
+             tables, not fuse into one, got {found:?}"
+        );
+        for t in &found {
+            assert_eq!(
+                t.rows.len(),
+                4,
+                "each table must keep its own 4 rows, not gain the other \
+                 table's rows, got {found:?}"
+            );
+        }
+    }
+
+    /// Case B3 from the round-4 review: unequal row pitches, chosen so a
+    /// fused candidate recovers STRICTLY more items than keeping the two
+    /// tables separate — reordering candidates alone (the B1 fix) cannot
+    /// catch this, because there is no tie to break. `A` has FEWER rows at
+    /// the tighter pitch (14pt) and `B` has MORE rows at the wider pitch
+    /// (34pt): with more rows, `B`'s pitch dominates pass 2's adaptive
+    /// grouping median (`find_table_regions_strict`, median × 3 window), so
+    /// the 50pt cross-table gap (50 < 34 × 3 = 102) falls inside the
+    /// grouping window and pass 2 fuses `A` and `B` together — this is the
+    /// shape a purely internal "how does this gap compare to this table's
+    /// OWN median" check cannot reliably reject (a small-pitch minority
+    /// table can leave the fused median too high to flag the seam).
+    /// `fuses_a_baseline_table` (this round's B3 fix) catches it instead by
+    /// comparing against the 12.0 baseline's own, separately-detected `A`.
+    #[test]
+    fn stacked_small_type_tables_with_unequal_pitch_are_not_fused() {
+        let table_a = small_type_grid_items(7.0, 3, 3, 14.0, false);
+        let last_a_y = 500.0 - 2.0 * 14.0;
+        let gap = 50.0;
+        let start_b_y = last_a_y - gap;
+        let shift = 500.0 - start_b_y;
+        let mut table_b = small_type_grid_items(7.0, 5, 3, 34.0, true);
+        for item in &mut table_b {
+            item.y -= shift;
+        }
+        let mut items = table_a;
+        items.extend(table_b);
+
+        // Sanity: this config actually WOULD fuse without the structural
+        // check — the pass-2-only candidate on its own straddles the
+        // cross-table gap — so this test exercises the real bug rather
+        // than a shape that was already fine, AND `fuses_a_baseline_table`
+        // correctly flags it against the 12.0 baseline.
+        let baseline = detect_tables(&items, 12.0, false);
+        let pass2_base = crate::small_type_candidate_bases(&items)[1];
+        let pass2_only = detect_tables(&items, pass2_base, false);
+        let gap_y_sanity = last_a_y - gap / 2.0;
+        assert!(
+            pass2_only.iter().any(|t| {
+                let above = t.rows.iter().filter(|&&y| y > gap_y_sanity).count();
+                let below = t.rows.iter().filter(|&&y| y <= gap_y_sanity).count();
+                above > 0 && below > 0
+            }),
+            "sanity: the pass-2-only candidate must straddle the gap on \
+             its own, or this fixture doesn't reproduce the fusion bug, \
+             got {pass2_only:?}"
+        );
+        assert!(
+            fuses_a_baseline_table(&baseline, &pass2_only),
+            "sanity: fuses_a_baseline_table must flag this exact fused \
+             candidate against the 12.0 baseline, or the structural check \
+             cannot be doing the work this test claims"
+        );
+
+        let found = detect_small_type_tables(&items);
+        assert!(
+            !found.is_empty(),
+            "sanity: this config must find something, or the straddle \
+             check below passes vacuously"
+        );
+        // Table A (3 rows, 14pt pitch) is exactly what the old fixed-12.0
+        // fallback returns alone for this shape — it must still be found
+        // intact, not just "not straddling".
+        assert!(
+            found.iter().any(|t| t.rows.len() == 3),
+            "table A's own 3 rows must survive intact somewhere in the \
+             result, got {found:?}"
+        );
+        // No table in the result may straddle both row-pitch regions, i.e.
+        // every table's rows must fit entirely above or entirely below the
+        // page gap.
+        let gap_y = last_a_y - gap / 2.0;
+        for t in &found {
+            let above = t.rows.iter().filter(|&&y| y > gap_y).count();
+            let below = t.rows.iter().filter(|&&y| y <= gap_y).count();
+            assert!(
+                above == 0 || below == 0,
+                "a table must not straddle the cross-table gap (fused \
+                 result), got rows {:?}",
+                t.rows
+            );
+        }
+    }
+
+    /// Adversarial cases `fuses_a_baseline_table` must survive: legitimately
+    /// irregular single-table spacing (a wider header gap, or one blank
+    /// middle row) must NOT be flagged as fusing the 12.0 baseline's own
+    /// table, or the structural check would discard genuinely better real
+    /// results. Since the check compares a later candidate's table against
+    /// the SAME baseline table, and neither of these shapes adds any items
+    /// beyond what 12.0 itself already finds (same page, same items, just a
+    /// wider gap SOMEWHERE inside one table), the item-set superset
+    /// condition never triggers — this test exists to pin that down with a
+    /// real assertion instead of leaving it as an unexercised property.
+    #[test]
+    fn row_gap_outlier_does_not_flag_legitimate_layouts() {
+        let check_not_fused = |items: &[TextItem], label: &str| {
+            let baseline = detect_tables(items, 12.0, false);
+            if baseline.is_empty() {
+                return; // nothing to compare against; not this test's concern
+            }
+            let bases = crate::small_type_candidate_bases(items);
+            for &base in bases.iter().skip(1) {
+                let tables = detect_tables(items, base, false);
+                if tables.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !fuses_a_baseline_table(&baseline, &tables),
+                    "{label} (base={base}) must not be flagged as fusing \
+                     the 12.0 baseline's own table, got baseline={baseline:?} \
+                     candidate={tables:?}"
+                );
+            }
+        };
+
+        for ratio in [1.5_f32, 2.0, 2.5] {
+            let mut items = small_type_grid_items(7.0, 6, 3, 14.0, false);
+            let max_y = items.iter().map(|i| i.y).fold(f32::MIN, f32::max);
+            let extra = 14.0 * (ratio - 1.0);
+            for item in items.iter_mut() {
+                if item.y == max_y {
+                    item.y += extra;
+                }
+            }
+            check_not_fused(&items, &format!("a {ratio}x header gap"));
+        }
+
+        // A single intentionally blank middle row: one 2x-pitch gap in an
+        // otherwise 14pt-pitch table, built directly instead of via
+        // `small_type_grid_items` (which has no notion of a skipped row).
+        let mut items = Vec::new();
+        let mut y = 500.0;
+        for r in 0..6 {
+            if r == 3 {
+                y -= 14.0; // skip a row: this gap is 2x the others
+            }
+            for c in 0..3 {
+                let text = format!("{}", 100 + r * 37 + c * 11);
+                let x = 60.0 + c as f32 * 120.0;
+                items.push(make_item(&text, x, y, 7.0, text.len() as f32 * 7.0 * 0.5));
+            }
+            y -= 14.0;
+        }
+        check_not_fused(&items, "a single blank middle row");
+    }
+
+    /// The regression this whole module exists to close: a 2-column
+    /// key/value table whose VALUES are short text (not numbers). At the
+    /// fixed 12.0 fallback such a page only ever reaches pass 1
+    /// (small-font), and pass 1's content check
+    /// (`has_table_like_content`) has no 2-column text bypass — only pass 2
+    /// (body-font) does. `detect_small_type_tables` fixes this because one
+    /// of its candidate bases pushes this UNIFORM-size page's items past
+    /// pass 1's threshold entirely, reaching pass 2 instead.
+    #[test]
+    fn key_value_text_table_needs_page_derived_base() {
+        let items = small_type_grid_items(7.5, 4, 2, 14.0, true);
+
+        assert_eq!(
+            detect_tables(&items, 12.0, false).len(),
+            0,
+            "sanity: the fixed 12.0 fallback must still fail to find this \
+             table, or this test no longer demonstrates the regression"
+        );
+
+        assert_eq!(
+            detect_small_type_tables(&items).len(),
+            1,
+            "a page-derived base should reach the body-font pass, which has \
+             the 2-column short-text content bypass pass 1 lacks"
+        );
+    }
+
+    /// The second regression case: a numeric table whose rows are spaced
+    /// wider than pass 1's fixed 30pt gap threshold. At 12.0 such a page
+    /// only ever reaches pass 1 (`find_table_regions`'s fixed 30pt gap),
+    /// which splits every row into its own undersized region. Pass 2
+    /// (`find_table_regions_strict`) uses an adaptive median-gap×3 window
+    /// and groups them correctly.
+    #[test]
+    fn wide_row_spacing_numeric_table_needs_page_derived_base() {
+        let items = small_type_grid_items(7.0, 3, 3, 35.0, false);
+
+        assert_eq!(
+            detect_tables(&items, 12.0, false).len(),
+            0,
+            "sanity: the fixed 12.0 fallback must still fail to find this \
+             table, or this test no longer demonstrates the regression"
+        );
+
+        assert_eq!(
+            detect_small_type_tables(&items).len(),
+            1,
+            "a page-derived base should push these items past pass 1's \
+             30pt-<=6.3pt threshold band entirely, reaching pass 2's \
+             adaptive row-gap grouping"
+        );
+    }
+
+    /// Like [`small_type_grid_items`], but the first `label_cols` columns
+    /// are set at `label_pt` and the rest at `value_pt` — the label/value
+    /// mixed-size shape a real small-type financial table takes (and the
+    /// shape the round-4 review found this fix corrupting: a base derived
+    /// from only the more common size drops the other size's whole column).
+    fn mixed_size_grid_items(
+        label_pt: f32,
+        value_pt: f32,
+        label_cols: usize,
+        rows: usize,
+        cols: usize,
+        row_spacing: f32,
+        textual: bool,
+    ) -> Vec<TextItem> {
+        const WORDS: &[&str] = &[
+            "Approved",
+            "Pending",
+            "Rejected",
+            "Closed",
+            "Draft",
+            "Active",
+            "On hold",
+            "Expired",
+            "Review",
+            "Filed",
+            "Open",
+            "Escalated",
+            "Draft two",
+            "Active two",
+            "On hold two",
+            "Expired two",
+            "Review two",
+            "Filed two",
+            "Open two",
+            "Escalated two",
+        ];
+        let mut items = Vec::new();
+        for r in 0..rows {
+            let y = 500.0 - r as f32 * row_spacing;
+            for c in 0..cols {
+                let x = 60.0 + c as f32 * 120.0;
+                let font_size = if c < label_cols { label_pt } else { value_pt };
+                // Cell text is unique per (r, c) — a completeness check that
+                // only asks "is this text present somewhere" cannot tell a
+                // correctly-shaped table with a genuinely blank cell apart
+                // from one that lost a whole column, if two different cells
+                // could share the same text.
+                let text = if textual {
+                    format!("{}-r{r}c{c}", WORDS[(r * cols + c) % WORDS.len()])
+                } else {
+                    format!("{}", 1000 + r * 137 + c * 11)
+                };
+                let width = text.len() as f32 * font_size * 0.5;
+                items.push(make_item(&text, x, y, font_size, width));
+            }
+        }
+        items
+    }
+
+    /// Like [`mixed_size_grid_items`], but the size split is by ROW instead
+    /// of by column: row 0 (the header) is at `header_pt`, every other row
+    /// is at `body_pt`. Reproduces the "8pt header over 7pt body" shape.
+    fn header_body_grid_items(
+        header_pt: f32,
+        body_pt: f32,
+        rows: usize,
+        cols: usize,
+        row_spacing: f32,
+    ) -> Vec<TextItem> {
+        const HEADERS: &[&str] = &["Region", "Q1", "Q2", "Q3", "Q4"];
+        let mut items = Vec::new();
+        for r in 0..rows {
+            let y = 500.0 - r as f32 * row_spacing;
+            let font_size = if r == 0 { header_pt } else { body_pt };
+            for c in 0..cols {
+                let x = 60.0 + c as f32 * 120.0;
+                let text = if r == 0 {
+                    HEADERS[c % HEADERS.len()].to_string()
+                } else {
+                    format!("{}", 1000 + r * 137 + c * 11)
+                };
+                let width = text.len() as f32 * font_size * 0.5;
+                items.push(make_item(&text, x, y, font_size, width));
+            }
+        }
+        items
+    }
+
+    /// Non-empty cells across every table `detect_small_type_tables`
+    /// returned — the completeness metric this module's mixed-size tests
+    /// care about. A table "found" with cells missing is worse than not
+    /// found at all, so counting tables alone (as the original 720/840
+    /// -config sweep did) cannot see the round-4 regression; counting
+    /// EMPTY cells too would just as easily hide a dropped column behind a
+    /// correctly-shaped grid of blanks, so this counts only cells that
+    /// actually hold text.
+    fn non_empty_cells(tables: &[Table]) -> usize {
+        tables
+            .iter()
+            .flat_map(|t| t.cells.iter().flatten())
+            .filter(|c| !c.trim().is_empty())
+            .count()
+    }
+
+    /// The specific repro cases a round-4 adversarial review found broken by
+    /// the page-derived-base fix's first two attempts: mode-based (tied
+    /// toward the larger size), then a single max-derived base — both push
+    /// a page's minority size out of range of whichever pass actually forms
+    /// a table, because pass 1 runs first and claims what it can before
+    /// pass 2 ever sees the rest. `detect_small_type_tables` (the actual
+    /// production entry point for an all-small-type page) is checked
+    /// directly against each one, not a single guessed base.
+    #[test]
+    fn mixed_size_repro_cases_from_round_4_review() {
+        // 1) The PR's own fixture shape: 12 values at 7pt, 4 labels at 8pt
+        //    (1 label column, 3 value columns, 4 rows == 16 cells total).
+        let labels_case = mixed_size_grid_items(8.0, 7.0, 1, 4, 4, 20.0, false);
+        let found = detect_small_type_tables(&labels_case);
+        assert_eq!(
+            non_empty_cells(&found),
+            16,
+            "8pt-label/7pt-value grid: all 16 cells (labels AND values) must \
+             survive, got {found:?}"
+        );
+
+        // 2) An 8pt header row over a 5x4 7pt body (24 cells total).
+        let header_case = header_body_grid_items(8.0, 7.0, 6, 4, 20.0);
+        let found = detect_small_type_tables(&header_case);
+        assert_eq!(
+            non_empty_cells(&found),
+            24,
+            "8pt-header/7pt-body grid: the header row must not be dropped, \
+             got {found:?}"
+        );
+
+        // 3) The tie case: a 4x2 table, 8.5pt labels / 6.5pt values — an
+        //    exact tie in most-common-size (4 items each), below the 6-item
+        //    minimum for either size alone, so no tie-break direction can
+        //    save a mode-based approach, and the size ratio (8.5/6.5 ≈
+        //    1.31) is too wide for a single pass-2-only base either. Trying
+        //    every candidate and keeping the best result is what actually
+        //    finds this one.
+        let tie_case = mixed_size_grid_items(8.5, 6.5, 1, 4, 2, 20.0, false);
+        let found = detect_small_type_tables(&tie_case);
+        assert_eq!(
+            non_empty_cells(&found),
+            8,
+            "8.5pt/6.5pt tie-case grid: all 8 cells must survive, got \
+             {found:?}"
+        );
+    }
+
+    /// Pins the pass-2-only candidate (B2's first untested candidate): a
+    /// config where 12.0 and the pass-1-only (`max/0.899`) candidate both
+    /// miss, and only the pass-2-only base recovers the table — so
+    /// removing the pass-2-only candidate from `small_type_candidate_bases`
+    /// would break this test, closing the "0 failures" mutation gap B2
+    /// found.
+    #[test]
+    fn pass2_only_candidate_is_uniquely_necessary() {
+        let items = mixed_size_grid_items(6.5, 6.0, 1, 3, 2, 35.0, false);
+
+        assert_eq!(
+            detect_tables(&items, 12.0, false).len(),
+            0,
+            "sanity: the 12.0 baseline must miss this config"
+        );
+
+        let bases = crate::small_type_candidate_bases(&items);
+        assert_eq!(
+            bases.len(),
+            3,
+            "sanity: this size spread must be narrow enough to offer a \
+             pass-2-only candidate, got bases {bases:?}"
+        );
+        let max0899 = *bases.last().expect("max/0.899 is always last");
+        assert_eq!(
+            detect_tables(&items, max0899, false).len(),
+            0,
+            "sanity: the pass-1-only (max/0.899) candidate must also miss \
+             this config, or it isn't uniquely a pass-2 win"
+        );
+        assert_eq!(
+            non_empty_cells(&detect_tables(&items, bases[1], false)),
+            6,
+            "sanity: the pass-2-only candidate must, on its own, recover \
+             all 6 cells — that's the uniqueness claim this test pins"
+        );
+
+        let found = detect_small_type_tables(&items);
+        assert_eq!(
+            non_empty_cells(&found),
+            6,
+            "detect_small_type_tables must recover all 6 cells via the \
+             pass-2-only candidate, got {found:?}"
+        );
+    }
+
+    /// Pins the pass-1-only (`max/0.899`) candidate (B2's second untested
+    /// candidate): a page whose size spread is too wide for the pass-2-only
+    /// candidate to exist at all (ratio > ~1.167), so `max/0.899` is the
+    /// only candidate — besides 12.0, which is derived independently of the
+    /// page — that can push the page through pass 1 as a whole. Removing
+    /// this candidate would break this test.
+    #[test]
+    fn max_0899_candidate_is_uniquely_necessary() {
+        // 6.0/8.5 ratio ~= 1.417, well outside pass 2's ~1.167 tolerance,
+        // so no pass-2-only candidate is offered at all — confirmed below.
+        // This exercises the max/0.899 candidate directly and confirms it
+        // recovers the full grid, but — UNLIKE the pass2-only test above —
+        // it does NOT establish that max/0.899 is the UNIQUE candidate that
+        // can do so: an attempt to construct a config where 12.0 misses and
+        // max/0.899 alone succeeds (`probe_find_max0899_unique_config`,
+        // swept across label/value sizes, column counts and spacings) found
+        // none — 12.0 and max/0.899 both push the whole small-type page
+        // through pass 1 as a unit once the page fits under 12.0's fixed
+        // ceiling, and this synthetic-grid search never separated them.
+        // Left here honestly as a gap: B2's own measurement (max/0.899
+        // "strictly wins 3,274 configs" in the reviewer's larger sweep)
+        // means a real distinguishing case almost certainly exists, just
+        // not one this search found — likely a shape this module's
+        // synthetic-grid helpers can't produce (a genuinely two-region
+        // page where pass 1 and pass 2 each claim a different part, which
+        // requires more structural variety than a single uniform/mixed
+        // grid gives).
+        let items = mixed_size_grid_items(8.5, 6.0, 1, 4, 3, 20.0, false);
+        let bases = crate::small_type_candidate_bases(&items);
+        assert_eq!(
+            bases.len(),
+            2,
+            "sanity: this size spread must be too wide for a pass-2-only \
+             candidate to be offered, got bases {bases:?}"
+        );
+        assert_eq!(bases[0], 12.0);
+
+        let found = detect_small_type_tables(&items);
+        assert_eq!(
+            non_empty_cells(&found),
+            12,
+            "detect_small_type_tables must recover all 12 cells via the \
+             page-derived max/0.899 candidate, got {found:?}"
+        );
+    }
+
+    /// Runs one mixed label/value-size sweep, column-split or header-split,
+    /// against `detect_small_type_tables` (the real production entry point
+    /// for an all-small-type page) and the old fixed-12.0 baseline, scoring
+    /// by non-empty-cell completeness rather than "was a table found at
+    /// all". Returns `(total, regressions, old_complete, new_complete)`.
+    ///
+    /// A regression here means `detect_small_type_tables` returned FEWER
+    /// non-empty cells than a bare `detect_tables(&items, 12.0, false)`
+    /// call would have — which should never happen by construction, since
+    /// 12.0 is always one of the candidates `detect_small_type_tables`
+    /// itself tries and scores (see its doc comment). This sweep exists to
+    /// check that construction actually holds across many configurations,
+    /// not just assert it once.
+    fn run_mixed_size_sweep(
+        sizes: &[f32],
+        row_counts: &[usize],
+        col_counts: &[usize],
+        spacings: &[f32],
+        content_shapes: &[bool],
+        header_split: bool,
+    ) -> (usize, usize, usize, usize) {
+        let mut total = 0usize;
+        let mut regressions = 0usize;
+        let mut old_complete = 0usize;
+        let mut new_complete = 0usize;
+
+        // `header_body_grid_items` ignores `textual` entirely (its body
+        // cells are always numeric), so iterating the full `content_shapes`
+        // list for a header-split sweep would run the identical config
+        // twice under two different labels and double-count it. Header
+        // splits get a single pass; column splits get the full list.
+        let effective_content_shapes: &[bool] = if header_split {
+            &[false]
+        } else {
+            content_shapes
+        };
+
+        for &size_a in sizes {
+            for &size_b in sizes {
+                for &rows in row_counts {
+                    for &cols in col_counts {
+                        for &spacing in spacings {
+                            for &textual in effective_content_shapes {
+                                // A header-row split with only 1 row is not
+                                // a mixed-size page at all.
+                                if header_split && rows < 2 {
+                                    continue;
+                                }
+                                total += 1;
+                                let expected = rows * cols;
+                                let items = if header_split {
+                                    header_body_grid_items(size_a, size_b, rows, cols, spacing)
+                                } else {
+                                    mixed_size_grid_items(
+                                        size_a, size_b, 1, rows, cols, spacing, textual,
+                                    )
+                                };
+
+                                let old_cells =
+                                    non_empty_cells(&detect_tables(&items, 12.0, false));
+                                let new_cells = non_empty_cells(&detect_small_type_tables(&items));
+
+                                if new_cells < old_cells {
+                                    regressions += 1;
+                                    eprintln!(
+                                        "REGRESSION ({}): a={size_a} b={size_b} rows={rows} \
+                                         cols={cols} spacing={spacing} textual={textual}: \
+                                         old_cells={old_cells} new_cells={new_cells}",
+                                        if header_split { "header" } else { "column" }
+                                    );
+                                }
+                                if old_cells == expected {
+                                    old_complete += 1;
+                                }
+                                if new_cells == expected {
+                                    new_complete += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        (total, regressions, old_complete, new_complete)
+    }
+
+    /// A sweep over INDEPENDENT label × value sizes (column-split AND
+    /// header-split), measuring per-config CELL completeness — not just
+    /// whether a table was found — against the OLD fixed-12.0 baseline via
+    /// `detect_small_type_tables`, the actual production path. This is what
+    /// the original 840-config sweep (below) could not see: it only varied
+    /// one size per page, so it never exercised the shape (differing
+    /// label/value or header/body sizes) that dropped cells in round 4.
+    ///
+    /// Kept small enough to run in `cargo test`'s default (non-`--ignored`)
+    /// set; `mixed_label_value_size_sweep_exhaustive` below is the same
+    /// sweep at the reviewer's full scale, marked `#[ignore]` since it is a
+    /// measurement run, not a fast unit test.
+    #[test]
+    fn mixed_label_value_size_sweep_measures_completeness() {
+        let sizes = [6.5_f32, 7.0, 7.5, 8.0, 8.5];
+        let row_counts = [3usize, 4];
+        let col_counts = [2usize, 3];
+        let spacings = [14.0_f32, 25.0];
+        let content_shapes = [false, true];
+
+        let (col_total, col_regressions, col_old, col_new) = run_mixed_size_sweep(
+            &sizes,
+            &row_counts,
+            &col_counts,
+            &spacings,
+            &content_shapes,
+            false,
+        );
+        let (hdr_total, hdr_regressions, hdr_old, hdr_new) = run_mixed_size_sweep(
+            &sizes,
+            &row_counts,
+            &col_counts,
+            &spacings,
+            &content_shapes,
+            true,
+        );
+
+        eprintln!(
+            "mixed_label_value_size_sweep_measures_completeness: column-split \
+             {col_total} configs (12.0 complete {col_old}, new complete \
+             {col_new}, regressions {col_regressions}); header-split \
+             {hdr_total} configs (12.0 complete {hdr_old}, new complete \
+             {hdr_new}, regressions {hdr_regressions})"
+        );
+
+        assert_eq!(
+            col_regressions + hdr_regressions,
+            0,
+            "detect_small_type_tables must never return FEWER cells than the \
+             fixed 12.0 fallback on any mixed-size config — a table \
+             found-but-incomplete is a worse failure than not found"
+        );
+        assert!(
+            col_new >= col_old && hdr_new >= hdr_old,
+            "detect_small_type_tables (column {col_new}/{col_total}, header \
+             {hdr_new}/{hdr_total}) must not do worse than the fixed 12.0 \
+             fallback (column {col_old}/{col_total}, header {hdr_old}/{hdr_total})"
+        );
+    }
+
+    /// The same measurement as `mixed_label_value_size_sweep_measures_completeness`
+    /// at the scale the round-4 review asked for: label size × value size
+    /// independently, 3-6 rows, 2-4 cols, all 7 of the standard row
+    /// spacings, numeric/text, both column-split AND header-split.
+    /// `#[ignore]`d because it is a slow measurement pass (thousands of
+    /// configs), not a fast unit test — run explicitly with `cargo test --
+    /// --ignored mixed_label_value_size_sweep_exhaustive --nocapture` to see
+    /// the counts.
+    ///
+    /// Reports the DIAGONAL (`label_size == value_size`, i.e. a uniform
+    /// page — the same shape `page_geometry_small_type_base_size_sweep`
+    /// covers) separately from the OFF-DIAGONAL (genuinely mixed sizes, the
+    /// round-4 regression's shape), because collapsing them into one number
+    /// hides which one is actually being exercised — the diagonal already
+    /// worked at the old fixed-12.0 fallback for any case pass 1's own
+    /// content/row-gap rules did not independently reject, so a sweep
+    /// dominated by diagonal configs would look reassuring for reasons that
+    /// have nothing to do with the round-4 fix.
+    #[test]
+    #[ignore = "slow exhaustive measurement sweep — run explicitly with --ignored"]
+    fn mixed_label_value_size_sweep_exhaustive() {
+        let sizes = [6.5_f32, 7.0, 7.5, 8.0, 8.5];
+        let row_counts = [3usize, 4, 5, 6];
+        let col_counts = [2usize, 3, 4];
+        let spacings = [9.0_f32, 14.0, 20.0, 25.0, 30.0, 35.0, 40.0];
+        let content_shapes = [false, true];
+
+        let mut diag_total = 0usize;
+        let mut diag_regressions = 0usize;
+        let mut diag_old_complete = 0usize;
+        let mut diag_new_complete = 0usize;
+        let mut off_total = 0usize;
+        let mut off_regressions = 0usize;
+        let mut off_old_complete = 0usize;
+        let mut off_new_complete = 0usize;
+
+        for &label_size in &sizes {
+            for &value_size in &sizes {
+                for &rows in &row_counts {
+                    for &cols in &col_counts {
+                        for &spacing in &spacings {
+                            for &textual in &content_shapes {
+                                let expected = rows * cols;
+                                let items = mixed_size_grid_items(
+                                    label_size, value_size, 1, rows, cols, spacing, textual,
+                                );
+                                let old_cells =
+                                    non_empty_cells(&detect_tables(&items, 12.0, false));
+                                let new_cells = non_empty_cells(&detect_small_type_tables(&items));
+                                let is_regression = new_cells < old_cells;
+                                let is_diagonal = label_size == value_size;
+
+                                if is_diagonal {
+                                    diag_total += 1;
+                                    if is_regression {
+                                        diag_regressions += 1;
+                                    }
+                                    if old_cells == expected {
+                                        diag_old_complete += 1;
+                                    }
+                                    if new_cells == expected {
+                                        diag_new_complete += 1;
+                                    }
+                                } else {
+                                    off_total += 1;
+                                    if is_regression {
+                                        off_regressions += 1;
+                                    }
+                                    if old_cells == expected {
+                                        off_old_complete += 1;
+                                    }
+                                    if new_cells == expected {
+                                        off_new_complete += 1;
+                                    }
+                                }
+                                if is_regression {
+                                    eprintln!(
+                                        "REGRESSION (column, {}): label={label_size} \
+                                         value={value_size} rows={rows} cols={cols} \
+                                         spacing={spacing} textual={textual}: \
+                                         old_cells={old_cells} new_cells={new_cells}",
+                                        if is_diagonal {
+                                            "diagonal"
+                                        } else {
+                                            "off-diagonal"
+                                        }
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "mixed_label_value_size_sweep_exhaustive (column-split): diagonal \
+             {diag_total} configs (12.0 complete {diag_old_complete}, new complete \
+             {diag_new_complete}, regressions {diag_regressions}); off-diagonal \
+             {off_total} configs (12.0 complete {off_old_complete}, new complete \
+             {off_new_complete}, regressions {off_regressions}); combined \
+             {} configs, 12.0 complete {}, new complete {}, regressions {}",
+            diag_total + off_total,
+            diag_old_complete + off_old_complete,
+            diag_new_complete + off_new_complete,
+            diag_regressions + off_regressions,
+        );
+
+        let (hdr_total, hdr_regressions, hdr_old, hdr_new) = run_mixed_size_sweep(
+            &sizes,
+            &row_counts,
+            &col_counts,
+            &spacings,
+            &content_shapes,
+            true,
+        );
+        eprintln!(
+            "mixed_label_value_size_sweep_exhaustive (header-split): \
+             {hdr_total} configs (12.0 complete {hdr_old}, new complete \
+             {hdr_new}, regressions {hdr_regressions})"
+        );
+
+        assert_eq!(
+            diag_regressions + off_regressions + hdr_regressions,
+            0,
+            "no regression is acceptable at any scale — see per-config output above"
+        );
+        assert!(diag_new_complete + off_new_complete >= diag_old_complete + off_old_complete);
+        assert!(hdr_new >= hdr_old);
+    }
+
+    /// The uniform-size sweep from an earlier round's PR #1 review
+    /// (5 sizes × 4 row-counts × 3 column-counts × 7 row-spacings × 2
+    /// content shapes = 840 configs, one uniform size per page — not a
+    /// mixed label/value size), against `detect_small_type_tables` (the
+    /// production entry point) compared to the fixed 12.0 fallback. This
+    /// sweep predates, and cannot see, the round-4 mixed-size regression —
+    /// `mixed_label_value_size_sweep_measures_completeness` and
+    /// `mixed_label_value_size_sweep_exhaustive` (above) are what cover that.
+    ///
+    /// This is a measurement, not a pinned golden count: individual counts
+    /// will drift if `detect_heuristic.rs`'s validation rules change, which
+    /// is expected. What must NOT change is the shape of the result: the
+    /// page-derived base must never lose a config the fixed fallback found
+    /// (a real regression), and it must recover a large share of what the
+    /// fixed fallback lost, without inventing tables on prose pages.
+    #[test]
+    fn page_geometry_small_type_base_size_sweep() {
+        let sizes = [6.5_f32, 7.0, 7.5, 8.0, 8.5];
+        let row_counts = [3usize, 4, 5, 6];
+        let col_counts = [2usize, 3, 4];
+        let spacings = [9.0_f32, 14.0, 20.0, 25.0, 30.0, 35.0, 40.0];
+        let content_shapes = [false, true]; // numeric, then textual
+
+        let mut total = 0usize;
+        let mut found_old = 0usize;
+        let mut found_new = 0usize;
+        let mut lost_at_new = 0usize;
+        let mut gained_at_new = 0usize;
+
+        for &size in &sizes {
+            for &rows in &row_counts {
+                for &cols in &col_counts {
+                    for &spacing in &spacings {
+                        for &textual in &content_shapes {
+                            total += 1;
+                            let items = small_type_grid_items(size, rows, cols, spacing, textual);
+
+                            let old_hit = !detect_tables(&items, 12.0, false).is_empty();
+                            let new_hit = !detect_small_type_tables(&items).is_empty();
+
+                            if old_hit {
+                                found_old += 1;
+                            }
+                            if new_hit {
+                                found_new += 1;
+                            }
+                            if old_hit && !new_hit {
+                                lost_at_new += 1;
+                            }
+                            if new_hit && !old_hit {
+                                gained_at_new += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "page_geometry_small_type_base_size_sweep: {total} configs — \
+             fixed-12.0 found {found_old}, page-derived found {found_new} \
+             ({gained_at_new} newly recovered, {lost_at_new} lost)"
+        );
+
+        assert_eq!(
+            lost_at_new, 0,
+            "page-derived base must never lose a table the fixed 12.0 \
+             fallback found — that would be a new regression, not a fix"
+        );
+        assert!(
+            gained_at_new > 0,
+            "the sweep should recover at least some of the configs Hardik's \
+             review found lost at the fixed 12.0 fallback"
+        );
+        assert!(
+            found_new > found_old,
+            "page-derived base ({found_new}) should find strictly more \
+             tables than the fixed 12.0 fallback ({found_old}) across this sweep"
+        );
+
+        // False-positive check: prose pages at the same small sizes must
+        // find zero tables under EITHER base.
+        let mut prose_false_positives = 0usize;
+        for &size in &sizes {
+            let prose = small_type_prose_items(size, 25, 13.0);
+            prose_false_positives += detect_tables(&prose, 12.0, false).len();
+            prose_false_positives += detect_small_type_tables(&prose).len();
+        }
+        assert_eq!(
+            prose_false_positives, 0,
+            "neither base should ever find a table on prose-only pages"
+        );
     }
 
     #[test]

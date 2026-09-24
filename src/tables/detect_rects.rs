@@ -6,7 +6,7 @@ use log::debug;
 
 use crate::types::{PdfRect, TextItem};
 
-use super::Table;
+use super::{CellOccupancy, CellRect, Table, TableSource};
 
 const DOMINANT_PAGE_BACKGROUND_MIN_REPETITIONS: usize = 8;
 const COMPETING_TABLE_MIN_ROWS: usize = 8;
@@ -513,20 +513,43 @@ fn detect_direct_rect_table(
         .or_else(|| detect_stacked_box_table(items, rects, page))
 }
 
+/// Strip Image placeholders before column/row clustering — an image's bbox
+/// would otherwise show up as a spurious column edge. See `is_text_layout_item`.
+///
+/// The dropped items are mapped back afterwards: `item_indices` is documented
+/// as indexing the caller's list, and dropping an item without remapping
+/// shifted every later index by one. With an image drawn ABOVE a table that
+/// silently renumbered the whole table's items.
 pub fn detect_tables_from_rects(
     items: &[TextItem],
     rects: &[PdfRect],
     page: u32,
 ) -> (Vec<Table>, Vec<RectHintRegion>) {
-    // Strip Image placeholders before column/row clustering — an image's bbox
-    // would otherwise show up as a spurious column edge. See `is_text_layout_item`.
-    let items_owned: Vec<TextItem> = items
+    let (kept, index_map): (Vec<TextItem>, Vec<usize>) = items
         .iter()
-        .filter(|i| crate::extractor::is_text_layout_item(i))
-        .cloned()
-        .collect();
-    let items = items_owned.as_slice();
+        .enumerate()
+        .filter(|(_, i)| crate::extractor::is_text_layout_item(i))
+        .map(|(idx, i)| (i.clone(), idx))
+        .unzip();
+    let (mut tables, hints) = detect_tables_from_rects_inner(&kept, rects, page);
+    if index_map.len() != items.len() {
+        for table in &mut tables {
+            for idx in &mut table.item_indices {
+                if let Some(&original) = index_map.get(*idx) {
+                    *idx = original;
+                }
+            }
+        }
+    }
+    (tables, hints)
+}
 
+/// `items` must already be free of non-layout (Image) items.
+fn detect_tables_from_rects_inner(
+    items: &[TextItem],
+    rects: &[PdfRect],
+    page: u32,
+) -> (Vec<Table>, Vec<RectHintRegion>) {
     // Filter rects on this page; normalize negative widths/heights; skip tiny rects.
     let mut page_rects: Vec<(f32, f32, f32, f32)> = Vec::new(); // (x, y, w, h) normalized
     for r in rects {
@@ -1252,7 +1275,13 @@ fn detect_stacked_box_table(
     );
     let columns = vec![boxes[0].0 + boxes[0].2 / 2.0];
     let rows: Vec<f32> = boxes.iter().map(|b| b.1 + b.3 / 2.0).collect();
-    Some(Table::new(columns, rows, cells, item_indices))
+    Some(Table::with_source(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 fn merge_overlapping_hints(mut hints: Vec<RectHintRegion>) -> Vec<RectHintRegion> {
@@ -1440,6 +1469,7 @@ pub(crate) fn detect_table_from_rect_group(
 
 /// Result from `try_build_grid` — distinguishes "few non-empty rows"
 /// (fixable by excluding page-background rects) from other failures.
+#[derive(Debug)]
 enum GridResult {
     Ok(Table),
     /// Grid was structurally valid but too few rows had content —
@@ -1555,14 +1585,70 @@ fn try_build_grid(
     // Build table: assign text items to cells
     let (mut cells, item_indices) = assign_items_to_grid(items, &col_edges, &row_edges, page);
 
+    // The horizontal half of the occupancy evidence is judged against the
+    // grid as ASSIGNED, before any fold rewrites it — see
+    // `non_merge_evidence_rects`, whose discriminator is "does more than one
+    // covered cell hold its own text".
+    let evidence_excluded =
+        non_merge_evidence_rects(group_rects, skip_rects, &col_edges, &row_edges, &cells);
+
     // Consolidate vertically-merged cells: rects spanning multiple grid rows
     // should have their text collected into the first sub-row.
     // Skip for wide tables (>10 columns) where spanning rects are typically
     // background fills rather than true merged cells (e.g. statistical lookup
     // tables with row-grouping shading).
-    if num_cols <= 10 {
-        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects);
-    }
+    let applied_merges = if num_cols <= 10 {
+        propagate_merged_cells(&mut cells, &col_edges, &row_edges, group_rects, skip_rects)
+    } else {
+        vec![false; group_rects.len()]
+    };
+
+    // Per-cell rect coverage, recorded from the real detected rects.
+    // `Some(rect)` means a detected `re` rect bigger than one grid slot is
+    // known to cover this position.
+    //
+    // Computed AFTER the fold, and for multi-row rects it is a readout of the
+    // fold rather than a second opinion about it. Occupancy and cell text are
+    // two views of one decision, so they may not disagree: a rect whose rows
+    // `propagate_merged_cells` actually collapsed is merge evidence, and one
+    // it left alone is not — whether it was left alone because the rect is a
+    // page background, because it is decoration, or because the column-count
+    // guard above skipped propagation entirely.
+    //
+    // Before this, the two were computed from different predicates —
+    // `non_merge_evidence_rects` for coverage, bare `skip_rects` for the fold
+    // — and a full-width band over two rows of a 4x6 table came back as cell
+    // text `"r0c0 r1c0"` (folded) alongside `is_own = true` (not folded).
+    //
+    // Single-row rects are untouched by the fold, so there is nothing for
+    // them to contradict; their evidence stays with `evidence_excluded`.
+    let mut merge_coverage: Vec<Vec<Option<CellRect>>> = vec![vec![None; num_cols]; num_rows];
+    let coverage_excluded: Vec<bool> = group_rects
+        .iter()
+        .enumerate()
+        .map(|(idx, &rect)| {
+            let (_, rows_spanned) = rect_span_counts(rect, &col_edges, &row_edges);
+            if rows_spanned > 1 {
+                // The fold is authoritative in BOTH directions. A rect it
+                // applied is merge evidence even if the decoration predicate
+                // would have called it a band — the text really was moved,
+                // and reporting `is_own = true` over moved text is the
+                // contradiction. A rect it left alone is not evidence even if
+                // the predicate would have allowed it.
+                return !applied_merges.get(idx).copied().unwrap_or(false);
+            }
+            // Single-row rects drive no fold, so there is nothing to agree
+            // with; the colspan discriminator decides.
+            evidence_excluded.get(idx).copied().unwrap_or(false)
+        })
+        .collect();
+    record_merge_coverage(
+        &col_edges,
+        &row_edges,
+        group_rects,
+        &coverage_excluded,
+        &mut merge_coverage,
+    );
 
     // Compute column centers and row centers for the Table struct
     let columns: Vec<f32> = (0..num_cols)
@@ -1658,10 +1744,51 @@ fn try_build_grid(
             return GridResult::Failed;
         }
     }
-    // Trim outer empty columns
-    let (columns, cells) = if first_col > 0 || last_col < num_cols - 1 {
+    // Build the full (pre-trim) per-cell occupancy from real detector
+    // evidence. `is_own` is NOT "cell has non-empty text" — it is whether
+    // this grid position is backed by its own single slot rather than by a
+    // wider/taller rect recorded in `merge_coverage`:
+    //   - `Some(rect)`: a real detected rect larger than one slot, and not
+    //     table decoration, covers this position — `is_own = false`, `rect`
+    //     = that covering rect. True both for positions the fold cleared and
+    //     for the fold target that kept the combined text.
+    //   - `None` with text: an ordinary cell — `is_own = true`, `rect`
+    //     synthesized from the grid edges (themselves derived from real `re`
+    //     rects, not from nothing).
+    //   - `None` and empty: no covering rect known — `is_own = true`,
+    //     `rect: None`.
+    let cell_occupancy: Vec<Vec<CellOccupancy>> = (0..num_rows)
+        .map(|r| {
+            (0..num_cols)
+                .map(|c| {
+                    let is_own = merge_coverage[r][c].is_none();
+                    let rect = if let Some(covering) = merge_coverage[r][c] {
+                        Some(covering)
+                    } else if !cells[r][c].trim().is_empty() {
+                        Some(CellRect {
+                            x: col_edges[c],
+                            y: row_edges[r + 1],
+                            width: col_edges[c + 1] - col_edges[c],
+                            height: row_edges[r] - row_edges[r + 1],
+                        })
+                    } else {
+                        None
+                    };
+                    CellOccupancy { is_own, rect }
+                })
+                .collect()
+        })
+        .collect();
+
+    // Trim outer empty columns — `cell_occupancy` stays in lockstep with
+    // `columns`/`cells` so indices remain aligned.
+    let (columns, cells, cell_occupancy) = if first_col > 0 || last_col < num_cols - 1 {
         let trimmed_cols: Vec<f32> = columns[first_col..=last_col].to_vec();
         let trimmed_cells: Vec<Vec<String>> = cells
+            .iter()
+            .map(|row| row[first_col..=last_col].to_vec())
+            .collect();
+        let trimmed_occupancy: Vec<Vec<CellOccupancy>> = cell_occupancy
             .iter()
             .map(|row| row[first_col..=last_col].to_vec())
             .collect();
@@ -1671,12 +1798,19 @@ fn try_build_grid(
             first_col,
             last_col
         );
-        (trimmed_cols, trimmed_cells)
+        (trimmed_cols, trimmed_cells, trimmed_occupancy)
     } else {
-        (columns, cells)
+        (columns, cells, cell_occupancy)
     };
 
-    GridResult::Ok(Table::new(columns, rows, cells, item_indices))
+    GridResult::Ok(Table::with_cell_occupancy(
+        columns,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Rects,
+        Some(cell_occupancy),
+    ))
 }
 
 /// Deduplicate nearby edge values within a tolerance, returning sorted unique edges.
@@ -1813,6 +1947,248 @@ fn remove_inner_delimiter_spaces(text: &str) -> String {
     result
 }
 
+/// Does this rect fully cover grid column `col` (within tolerance)?
+fn rect_covers_col(rx: f32, rw: f32, col_edges: &[f32], col: usize) -> bool {
+    const TOL: f32 = 6.0;
+    rx <= col_edges[col] + TOL && (rx + rw) >= col_edges[col + 1] - TOL
+}
+
+/// Does this rect overlap grid row `row` by more than tolerance?
+///
+/// Deliberately an OVERLAP test, not the full-coverage test used for
+/// columns. A "rect bottom <= row top + tol AND rect top >= row bottom - tol"
+/// check gives false positives at shared row boundaries — a rect whose top
+/// equals row N's bottom lies entirely below the row but still passes the
+/// tolerance slack, cascading unrelated rows' text into one merged cell.
+fn rect_spans_row(ry: f32, rh: f32, row_edges: &[f32], row: usize) -> bool {
+    const TOL: f32 = 6.0;
+    let row_top = row_edges[row];
+    let row_bot = row_edges[row + 1];
+    (row_top.min(ry + rh) - row_bot.max(ry)).max(0.0) > TOL
+}
+
+/// How many grid columns and rows a rect covers.
+fn rect_span_counts(
+    rect: (f32, f32, f32, f32),
+    col_edges: &[f32],
+    row_edges: &[f32],
+) -> (usize, usize) {
+    let (rx, ry, rw, rh) = rect;
+    let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges.len().saturating_sub(1);
+    let cols = (0..num_cols)
+        .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
+        .count();
+    let rows = (0..num_rows)
+        .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
+        .count();
+    (cols, rows)
+}
+
+/// Rects that must not drive merged-cell TEXT CONSOLIDATION, as a mask
+/// parallel to `group_rects`.
+///
+/// Starts from the caller's `skip_rects` (page-background rects the
+/// origin-anchored retry already identified) and adds **decorative row
+/// shading**: the full-width bands a statistical or register table paints
+/// behind groups of rows. Those are not merges, and folding them as merges
+/// destroys text.
+///
+/// The predicate is deliberately INDEPENDENT OF COLUMN COUNT. What
+/// distinguishes decoration from a merge is how many COLUMNS a multi-row
+/// rect covers at once: a genuine merged cell is a cell (one column,
+/// occasionally two), whereas a shading band is table furniture spanning the
+/// table's whole width, i.e. the merge source in a strict majority of
+/// columns, which no real merged cell is.
+///
+/// A rect is decoration when all four hold:
+///   1. it spans more than one grid row (otherwise it drives no fold);
+///   2. it spans at most HALF the grid's rows — a row GROUP is a few rows;
+///      a rect covering most rows is a frame or page background, a different
+///      category handled by `detect_table_from_rect_group`'s
+///      `FewNonEmptyRows` retry;
+///   3. it covers at least three columns — a floor that keeps a legitimate
+///      2x2 merge in a small grid out of the net; and
+///   4. it covers a strict majority of all columns.
+///
+/// The asymmetry is chosen on purpose: misreading decoration as a merge
+/// DESTROYS text, while failing to fold a genuine merge merely leaves text
+/// where it already was.
+fn decorative_fill_rects(
+    group_rects: &[(f32, f32, f32, f32)],
+    skip_rects: &[bool],
+    col_edges: &[f32],
+    row_edges: &[f32],
+) -> Vec<bool> {
+    let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges.len().saturating_sub(1);
+
+    group_rects
+        .iter()
+        .enumerate()
+        .map(|(idx, &rect)| {
+            if skip_rects.get(idx).copied().unwrap_or(false) {
+                return true;
+            }
+            let (cols_covered, rows_spanned) = rect_span_counts(rect, col_edges, row_edges);
+            if rows_spanned < 2 {
+                return false;
+            }
+            rows_spanned * 2 <= num_rows && cols_covered >= 3 && cols_covered * 2 > num_cols
+        })
+        .collect()
+}
+
+/// Rects that must not be treated as per-cell MERGE EVIDENCE, as a mask
+/// parallel to `group_rects`.
+///
+/// A superset of [`decorative_fill_rects`], and the difference is the point.
+/// Text consolidation only ever fires on a rect spanning several rows, so
+/// that predicate can ignore single-row rects entirely. Occupancy reporting
+/// cannot: a rect spanning one row and every column — a plain decorative
+/// shading band behind one row of a grid — covers several cells, and reading
+/// it as a merge reports `is_own = false` for every column of that row even
+/// though each cell holds its own distinct text. A consumer filling down
+/// from the covering rect would then merge unrelated cells.
+///
+/// So this mask additionally excludes a rect that lies within ONE row, covers
+/// several columns, and has its own distinct text in more than one of the
+/// cells it covers. The cell contents are the discriminator, and they are a
+/// principled one: a merged cell holds one run of content — that is what
+/// being merged means — whereas a band painted behind a row sits over cells
+/// that each hold their own. A single-row colspan whose covered cells hold
+/// one run between them is still reported as the merge it is.
+///
+/// The test is applied only to purely horizontal spans. A multi-ROW span
+/// cannot use it: the sub-rows of a genuine rowspan routinely hold wrapped
+/// continuation lines of one logical value, which is exactly why
+/// `propagate_merged_cells` folds them together, so "more than one non-empty
+/// cell" does not mean "more than one value" there.
+///
+/// `cells` must be the grid as assigned, BEFORE any fold rewrites it.
+///
+/// The failure direction is deliberate: a missed merge leaves a consumer
+/// reading each cell's own text, an invented merge makes it discard text that
+/// was really there.
+fn non_merge_evidence_rects(
+    group_rects: &[(f32, f32, f32, f32)],
+    skip_rects: &[bool],
+    col_edges: &[f32],
+    row_edges: &[f32],
+    cells: &[Vec<String>],
+) -> Vec<bool> {
+    let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges.len().saturating_sub(1);
+    let decorative = decorative_fill_rects(group_rects, skip_rects, col_edges, row_edges);
+
+    group_rects
+        .iter()
+        .enumerate()
+        .map(|(idx, &rect)| {
+            if decorative[idx] {
+                return true;
+            }
+            let (rx, ry, rw, rh) = rect;
+            let rows: Vec<usize> = (0..num_rows)
+                .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
+                .collect();
+            if rows.len() != 1 {
+                return false;
+            }
+            let row = rows[0];
+            let cols: Vec<usize> = (0..num_cols)
+                .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
+                .collect();
+            if cols.len() < 2 {
+                return false;
+            }
+            let occupied = cols
+                .iter()
+                .filter(|&&c| {
+                    cells
+                        .get(row)
+                        .and_then(|r| r.get(c))
+                        .is_some_and(|text| !text.trim().is_empty())
+                })
+                .count();
+            occupied > 1
+        })
+        .collect()
+}
+
+/// Record, for every grid position, the real detected `re` rect known to
+/// cover it when that rect is bigger than a single grid slot — spanning
+/// multiple rows (a rowspan), multiple columns (a colspan), or both. This is
+/// the evidence `Table::cell_occupancy` reports: `is_own == false` means
+/// "this position's true geometry is the recorded rect, not its own one-slot
+/// grid cell".
+///
+/// `excluded[i]` masks rects that are not merge evidence. The caller decides
+/// that per rect and the rule is not uniform: a multi-row rect is masked by
+/// whether `propagate_merged_cells` actually folded its rows, so a rect the
+/// fold applied counts as evidence even when [`non_merge_evidence_rects`]
+/// would have classified it as decoration — the text really moved, and
+/// reporting `is_own = true` over moved text is the contradiction. A
+/// single-row rect drives no fold, so there the decoration classification
+/// (page backgrounds, shading bands — see [`non_merge_evidence_rects`]) is
+/// what masks it.
+///
+/// OVERLAP RESOLUTION: when several qualifying rects cover the same cell the
+/// LARGEST-AREA rect wins, ties broken by lowest `group_rects` index. Real
+/// merge geometry is the outermost rect; any smaller rect covering the same
+/// slots is painted inside it.
+fn record_merge_coverage(
+    col_edges: &[f32],
+    row_edges: &[f32],
+    group_rects: &[(f32, f32, f32, f32)],
+    excluded: &[bool],
+    merge_coverage: &mut [Vec<Option<CellRect>>],
+) {
+    let num_cols = col_edges.len().saturating_sub(1);
+    let num_rows = row_edges.len().saturating_sub(1);
+
+    for (rect_idx, &rect) in group_rects.iter().enumerate() {
+        if excluded.get(rect_idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let (rx, ry, rw, rh) = rect;
+        let cols: Vec<usize> = (0..num_cols)
+            .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
+            .collect();
+        let rows: Vec<usize> = (0..num_rows)
+            .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
+            .collect();
+        // Exactly one slot is an ordinary, own cell — not merge evidence.
+        if cols.len() * rows.len() <= 1 {
+            continue;
+        }
+        let covering = CellRect {
+            x: rx,
+            y: ry,
+            width: rw,
+            height: rh,
+        };
+        let area = rw.abs() * rh.abs();
+        for &r in &rows {
+            for &c in &cols {
+                let Some(slot) = merge_coverage.get_mut(r).and_then(|row| row.get_mut(c)) else {
+                    continue;
+                };
+                let replace = match slot {
+                    None => true,
+                    // Strictly greater, so a later rect of equal area does
+                    // not displace an earlier one — that is what makes the
+                    // tie-break "lowest index wins" rather than arbitrary.
+                    Some(existing) => area > existing.width.abs() * existing.height.abs(),
+                };
+                if replace {
+                    *slot = Some(covering);
+                }
+            }
+        }
+    }
+}
+
 /// Consolidate text in vertically-merged cells.
 ///
 /// When a single rect spans multiple grid rows (e.g. a "Classification" label
@@ -1820,13 +2196,20 @@ fn remove_inner_delimiter_spaces(text: &str) -> String {
 /// others have an empty cell.  This function detects such spans and moves all
 /// text into the first sub-row, clearing the rest so that downstream
 /// continuation-merge in `clean_table_cells` collapses sub-rows correctly.
+///
+/// Returns a mask parallel to `group_rects`: `true` where that rect actually
+/// drove a fold in at least one column. Occupancy evidence is built from this
+/// so that what is reported and what the cell text says cannot disagree; see
+/// the call site in `try_build_grid`. Nothing about the fold decision itself
+/// is changed by reporting it.
 fn propagate_merged_cells(
     cells: &mut [Vec<String>],
     col_edges: &[f32],
     row_edges: &[f32],
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
-) {
+) -> Vec<bool> {
+    let mut applied = vec![false; group_rects.len()];
     let num_cols = col_edges.len() - 1;
     let num_rows = row_edges.len() - 1;
     let tol = 6.0;
@@ -1886,8 +2269,11 @@ fn propagate_merged_cells(
             for row in cells.iter_mut().take(last + 1).skip(first + 1) {
                 row[col] = String::new();
             }
+            applied[rect_idx] = true;
         }
     }
+
+    applied
 }
 
 /// Check if rects form a row-stripe pattern (full-width horizontal bands).
@@ -2153,7 +2539,13 @@ fn detect_row_stripe_table(
         content_ratio * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Detect a grid that swallowed body text instead of tabular data.
@@ -3148,7 +3540,13 @@ fn detect_row_stripe_table_from_cell_rects(
         non_empty_cells as f32 / total_cells * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Merge wrapped description-line bands back into their visual data rows.
@@ -3461,7 +3859,13 @@ fn detect_merged_cluster_table(
         content_ratio * 100.0
     );
 
-    Some(Table::new(column_centers, row_centers, cells, item_indices))
+    Some(Table::with_source(
+        column_centers,
+        row_centers,
+        cells,
+        item_indices,
+        TableSource::Rects,
+    ))
 }
 
 /// Cluster text item X positions into column centers with a given minimum threshold.
@@ -5744,5 +6148,174 @@ mod tests {
             "table should have at most ~7 rows from group 1, got {}",
             table.rows.len()
         );
+    }
+
+    // --- cell occupancy: merge evidence vs. decoration ---------------------
+
+    /// One rect's bounds: `(x, y, width, height)`.
+    type Rect = (f32, f32, f32, f32);
+
+    /// A 4-column x 3-row grid of per-cell rects, one distinct text item per
+    /// cell. `shaded_rows` additionally get a full-width decorative band
+    /// painted behind the whole row — the shape a reviewer reproduced as a
+    /// cell-occupancy false positive.
+    fn shaded_grid(shaded_rows: &[usize]) -> (Vec<TextItem>, Vec<Rect>) {
+        const COLS: usize = 4;
+        const ROWS: usize = 3;
+        const COL_W: f32 = 50.0;
+        const ROW_H: f32 = 30.0;
+        // Row 0 is the top row; y grows upwards.
+        let row_bottom = |r: usize| (ROWS - 1 - r) as f32 * ROW_H;
+
+        let mut rects = Vec::new();
+        let mut items = Vec::new();
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                rects.push((c as f32 * COL_W, row_bottom(r), COL_W, ROW_H));
+                items.push(make_item(
+                    &format!("r{r}c{c}"),
+                    c as f32 * COL_W + 5.0,
+                    row_bottom(r) + 10.0,
+                    9.0,
+                ));
+            }
+        }
+        for &r in shaded_rows {
+            // A decorative band: full table width, exactly one row tall.
+            rects.push((0.0, row_bottom(r), COL_W * COLS as f32, ROW_H));
+        }
+        (items, rects)
+    }
+
+    fn built_grid(items: &[TextItem], rects: &[(f32, f32, f32, f32)]) -> Table {
+        let skip = vec![false; rects.len()];
+        match try_build_grid(items, rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected a grid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_width_row_shading_is_not_cell_merge_evidence() {
+        // Reviewer reproduction: a plain shading band behind a row was read
+        // as a merge, so every column of that row reported `is_own = false`
+        // although each cell held its own distinct text. A consumer filling
+        // down from the covering rect would merge unrelated cells.
+        let (items, rects) = shaded_grid(&[1]);
+        let table = built_grid(&items, &rects);
+        let occupancy = table
+            .cell_occupancy
+            .as_ref()
+            .expect("rect-detected grids carry per-cell occupancy");
+
+        for (r, row) in occupancy.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                assert!(
+                    cell.is_own,
+                    "cell ({r},{c}) holds its own text ({:?}) and must not be \
+                     reported as covered by a decorative shading band",
+                    table.cells[r][c]
+                );
+            }
+        }
+        // And the distinct text is still all there, one cell each.
+        for (r, row) in table.cells.iter().enumerate() {
+            for (c, text) in row.iter().enumerate() {
+                assert_eq!(text.trim(), format!("r{r}c{c}"));
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_rowspan_is_still_reported_as_merge_evidence() {
+        // The other direction: suppressing decoration must not suppress a
+        // real merge. One rect spanning two rows of a single column is a
+        // rowspan, and must still report `is_own = false` with that rect.
+        let (items, mut rects) = shaded_grid(&[]);
+        // Column 0, covering the bottom two rows (y 0..60).
+        let span = (0.0, 0.0, 50.0, 60.0);
+        rects.push(span);
+        let table = built_grid(&items, &rects);
+        let occupancy = table
+            .cell_occupancy
+            .as_ref()
+            .expect("rect-detected grids carry per-cell occupancy");
+
+        for r in [1usize, 2] {
+            assert!(
+                !occupancy[r][0].is_own,
+                "cell ({r},0) is covered by a genuine two-row span"
+            );
+            let rect = occupancy[r][0].rect.expect("covering rect is reported");
+            assert_eq!((rect.x, rect.y, rect.width, rect.height), span);
+        }
+        // Untouched columns keep their own geometry.
+        assert!(occupancy[1][1].is_own);
+        assert!(occupancy[2][3].is_own);
+    }
+
+    #[test]
+    fn wide_tables_report_occupancy_that_agrees_with_their_text() {
+        // Occupancy and cell text are two views of ONE decision and may not
+        // disagree. This asserts that agreement rather than either outcome,
+        // because the outcome is a property of the fold policy and not of the
+        // reporting: while `propagate_merged_cells` is skipped above 10
+        // columns the span below is not folded, so every cell keeps its own
+        // text AND must report `is_own = true`; if that guard is ever lifted,
+        // the text folds and the same assertion demands `is_own = false` with
+        // the covering rect. What must never happen is one without the other.
+        const COLS: usize = 12;
+        const ROWS: usize = 3;
+        const COL_W: f32 = 20.0;
+        const ROW_H: f32 = 30.0;
+        let row_bottom = |r: usize| (ROWS - 1 - r) as f32 * ROW_H;
+
+        let mut rects = Vec::new();
+        let mut items = Vec::new();
+        for r in 0..ROWS {
+            for c in 0..COLS {
+                rects.push((c as f32 * COL_W, row_bottom(r), COL_W, ROW_H));
+                items.push(make_item(
+                    &format!("{r}{c}"),
+                    c as f32 * COL_W + 2.0,
+                    row_bottom(r) + 10.0,
+                    6.0,
+                ));
+            }
+        }
+        let span = (0.0, 0.0, COL_W, ROW_H * 2.0);
+        rects.push(span);
+
+        let table = built_grid(&items, &rects);
+        let occupancy = table
+            .cell_occupancy
+            .as_ref()
+            .expect("rect-detected grids carry per-cell occupancy");
+        // Did the fold actually run over the span's rows (1 and 2, column 0)?
+        let folded = table.cells[2][0].trim().is_empty();
+        if folded {
+            for r in [1, 2] {
+                assert!(
+                    !occupancy[r][0].is_own,
+                    "column 0 text was folded, so occupancy must report the covering rect"
+                );
+                let rect = occupancy[r][0].rect.expect("covering rect is reported");
+                assert_eq!((rect.x, rect.y, rect.width, rect.height), span);
+            }
+        } else {
+            for r in [1, 2] {
+                assert!(
+                    occupancy[r][0].is_own,
+                    "column 0 kept its own text ({:?}), so occupancy may not claim a merge",
+                    table.cells[r][0]
+                );
+                // `is_own` cells report their own one-slot geometry, never
+                // the two-row span.
+                let rect = occupancy[r][0].rect.expect("own slot is reported");
+                assert_ne!((rect.x, rect.y, rect.width, rect.height), span);
+                assert_eq!(rect.height, ROW_H);
+            }
+        }
+        assert!(occupancy[1][1].is_own);
     }
 }

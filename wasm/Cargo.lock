@@ -729,6 +729,8 @@ dependencies = [
  "once_cell",
  "rayon",
  "regex",
+ "serde",
+ "serde_json",
  "thiserror",
  "ttf-parser",
  "unicode-bidi",

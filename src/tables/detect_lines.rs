@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::tables::Table;
+use crate::tables::{Table, TableSource};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use super::cell_text::{cell_fragment, join_cell_items, push_cell_item};
@@ -333,11 +333,12 @@ fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule])
         .map(|rule| rule.2)
         .fold(f32::NEG_INFINITY, f32::max);
     let split = x_min + (x_max - x_min) * 0.35;
-    Some(Table::new(
+    Some(Table::with_source(
         vec![x_min, split, x_max],
         vec![rows[0].0],
         vec![vec![header, value]],
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -559,11 +560,12 @@ fn build_text_anchor_table(
         return None;
     }
 
-    Some(Table::new(
+    Some(Table::with_source(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -908,11 +910,12 @@ fn build_dense_row_anchor_table(
         return None;
     }
 
-    Some(Table::new(
+    Some(Table::with_source(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -1040,7 +1043,13 @@ fn build_open_edge_grid_table_for_rules(
     let mut rows = Vec::with_capacity(row_edges.len());
     rows.push(header_y);
     rows.extend_from_slice(&row_edges[..row_edges.len() - 1]);
-    Some(Table::new(col_edges, rows, cells, item_indices))
+    Some(Table::with_source(
+        col_edges,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Lines,
+    ))
 }
 
 fn build_open_edge_grid_tables(
@@ -1428,11 +1437,12 @@ fn refine_segment_grid_text_rows(
         cells.len(),
         dense_rows
     );
-    Some(Table::new(
+    Some(Table::with_source(
         table.columns.clone(),
         anchored_rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -2101,11 +2111,12 @@ fn detect_tables_from_lines_inner(
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    let legacy_table = Table::new(
+    let legacy_table = Table::with_source(
         col_edges,
         row_edges_desc[..num_rows].to_vec(),
         cells,
         item_indices,
+        TableSource::Lines,
     );
     let legacy_tables = if overlaps_multiple_tables(&legacy_table, &independent_segment_tables) {
         log::debug!(
