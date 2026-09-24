@@ -11876,6 +11876,134 @@ fn test_sparse_banded_body_survives_partially_populated_columns() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Round 6: `self_populated * 2 == cols.len()` -- an EXACT tie -- fell through
+// both the majority test and the minority rescue to the implicit "not
+// decoration" default. These are the full-pipeline (`page_geometry_mem`, the
+// same real-PDF path every round-3/4/5 fixture above uses) versions of the
+// three confirmed regressions, plus the fold-side and the narrow-band mirror
+// case, matching the grid-level tests in `src/tables/detect_rects.rs`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_full_pipeline_exact_half_populated_columns_small_band_stays_decoration() {
+    // 12 cols, band over cols 1-9 (8 covered columns), 5 rows tall. 4 of the
+    // 8 covered columns (1-4) fully populated, 4 (5-8) blank.
+    // self_populated = 4, cols.len() = 8: an exact tie, well under
+    // `LARGE_BAND_ROW_COUNT` -- must stay decoration.
+    let (cols, rows, band, c0, c1) = (12usize, 6usize, (1usize, 5usize), 1usize, 9usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        c < 5
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "full pipeline: exact-half populated columns, small band",
+    );
+}
+
+#[test]
+fn test_full_pipeline_exact_half_populated_of_two_columns_narrow_band_stays_decoration() {
+    // 12 cols (>10), band over cols 4-6 (2 covered columns, narrow), 6 rows
+    // tall (>=4). Column 4 fully populated, column 5 blank.
+    // self_populated = 1, cols.len() = 2: an exact tie.
+    let (cols, rows, band, c0, c1) = (12usize, 10usize, (2usize, 7usize), 4usize, 6usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        c == 4
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "full pipeline: exact-half tie, 1-of-2 narrow columns populated",
+    );
+}
+
+#[test]
+fn test_full_pipeline_exact_half_populated_large_band_still_folds() {
+    // The fold side of the tiebreak, through the full extraction pipeline:
+    // 12 cols, band over cols 1-9 (8 covered, WIDE), 22 rows tall in a
+    // 24-row table. 4 of the 8 covered columns fully populated, 4 blank.
+    // self_populated = 4, cols.len() = 8: a tie, but `rows.len() = 22 >=
+    // LARGE_BAND_ROW_COUNT` and the band is not narrow, so this must still
+    // be trusted as a genuine merge (the way `test_snapshot_2013_app2` is).
+    let (cols, rows, band, c0, c1) = (12usize, 24usize, (1usize, 22usize), 1usize, 9usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        c < 5
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    // A fold merges the band's rows together in its populated columns, so
+    // column 1's per-row identity must be LOST -- unlike the decoration
+    // cases above, this must NOT be population-intact.
+    let band_col1_texts: Vec<&str> = cells[band.0..=band.1]
+        .iter()
+        .map(|row| row[1].trim())
+        .collect();
+    assert!(
+        band_col1_texts.iter().any(|t| t.contains(' ')),
+        "full pipeline: expected the large tied band's populated column to \
+         fold multiple rows' text together, got {band_col1_texts:?}"
+    );
+}
+
+#[test]
+fn test_full_pipeline_tall_narrow_column_stripe_exact_tie_stays_decoration() {
+    // The mirror of the fold-side test above, through the full pipeline:
+    // a NARROW band (2 covered columns) instead of a wide one -- a
+    // full-height zebra stripe over 2 columns where only 1 is populated,
+    // spanning 25 of 30 rows in a 12-column table. Same shape as the
+    // confirmed 1-of-2-columns regression, just tall enough to clear
+    // `LARGE_BAND_ROW_COUNT`. Height alone must NOT decide this tie --
+    // `is_narrow` bands stay decoration regardless of height, since no
+    // genuine narrow multi-row merge in the corpus is more than a few rows
+    // tall.
+    let (cols, rows, band, c0, c1) = (12usize, 30usize, (2usize, 26usize), 4usize, 6usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        c == 4
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "full pipeline: tall narrow column stripe, exact tie",
+    );
+}
+
 #[test]
 fn test_page_geometry_mem_wide_table_gets_real_merge_occupancy() {
     // Regression test: `propagate_merged_cells` used to be skipped entirely
