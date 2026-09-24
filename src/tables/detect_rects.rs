@@ -2123,11 +2123,63 @@ fn decorative_fill_rects(
             }
             let (rx, ry, rw, rh) = rect;
             let (cols_covered, rows_spanned) = rect_span_counts(rect, col_edges, row_edges);
-            if rows_spanned < 2 || cols_covered < 3 || cols_covered * 2 <= num_cols {
+            if rows_spanned < 2 {
                 return false;
             }
-            if rows_spanned * 2 <= num_rows {
+            let tall_band = rows_spanned * 2 > num_rows;
+            // The column-width gate below (`cols_covered < 3 ||
+            // cols_covered * 2 <= num_cols`) exists to keep the OLD,
+            // unconditional row-count rule (below) conservative: a band
+            // that covers few columns is cheap to mistake for a narrow
+            // multi-row merge, so that legacy rule only ever fires on
+            // wide bands. It must NOT gate the newer content+subdivision
+            // test for tall bands (>half the table's rows), because that
+            // test has its own independent geometric evidence
+            // (`contains_stacked_subrects`) that a narrow band or a
+            // single-column stripe can supply just as well as a wide one
+            // — gating it here was why narrow bands and column stripes
+            // fell straight through to "fold" without ever being
+            // evaluated (regression: rows folding in wide tables for
+            // 5/12, 2/12, 6/12-column bands and single-column stripes).
+            if !tall_band {
+                if cols_covered < 3 || cols_covered * 2 <= num_cols {
+                    return false;
+                }
                 return true;
+            }
+            // A narrow band is geometrically indistinguishable from a
+            // genuine narrow rowspan by column count alone, so the
+            // content+subdivision test is only trusted for one when TWO
+            // extra conditions both hold, matching what was actually
+            // measured:
+            //   - `rows_spanned >= 4`: a real two-row merge in a small
+            //     table (e.g. 3 rows) also satisfies `tall_band`, but every
+            //     narrow decorative band Hardik's fixtures reported was
+            //     4-6 cell-heights tall, never a 2-row span.
+            //     `genuine_rowspan_is_still_reported_as_merge_evidence` and
+            //     `test_genuine_narrow_rowspan_in_a_wide_table_still_propagates`
+            //     pin the 2-row case.
+            //   - `num_cols > 10`: `accessory_building_rejects_prose_in_frame`'s
+            //     real 3-column TYPE/SIZE/SETBACKS form data table has a
+            //     genuine rect spanning several rows in ONE of its three
+            //     columns and clears the height bound above too, and a
+            //     6-column real invoice/schedule table
+            //     (`test_snapshot_2013_app2`) has a genuine narrow-column
+            //     merge that clears both a `num_cols >= 6` version of this
+            //     bound AND the height bound — the shape this predicate
+            //     exists to protect is specifically a WIDE table (every
+            //     measured fixture in the round-4 review was 12 columns)
+            //     with a narrow decorative band, not a narrower table's own
+            //     genuine merge. `> 10` matches the pre-existing "wide
+            //     table" convention this file already uses elsewhere (the
+            //     old `num_cols <= 10` merge-propagation guard). Below this
+            //     width the legacy, safer "not decoration" answer is kept.
+            // A narrow-but-short OR narrow-but-narrow-table band never
+            // reaches the content+subdivision test at all.
+            if (cols_covered < 3 || cols_covered * 2 <= num_cols)
+                && (rows_spanned < 4 || num_cols <= 10)
+            {
+                return false;
             }
             let rows: Vec<usize> = (0..num_rows)
                 .filter(|&r| rect_spans_row(ry, rh, row_edges, r))
@@ -2135,6 +2187,13 @@ fn decorative_fill_rects(
             let cols: Vec<usize> = (0..num_cols)
                 .filter(|&c| rect_covers_col(rx, rw, col_edges, c))
                 .collect();
+            if cols.is_empty() {
+                return false;
+            }
+            let has_subdivision = contains_stacked_subrects(rect, group_rects);
+            if !has_subdivision {
+                return false;
+            }
             let self_populated = cols
                 .iter()
                 .filter(|&&c| {
@@ -2149,7 +2208,41 @@ fn decorative_fill_rects(
                         >= 2
                 })
                 .count();
-            self_populated * 2 > cols.len() && contains_stacked_subrects(rect, group_rects)
+            if self_populated * 2 > cols.len() {
+                // Strong evidence: a majority of covered columns have text
+                // spread across two or more of the band's rows AND the
+                // area is geometrically subdivided. Confirmed decoration.
+                return true;
+            }
+            // The majority-content test failed, but the band IS
+            // geometrically subdivided (`has_subdivision`). Measured
+            // against `test_snapshot_2013_app2` (a real 6-column
+            // invoice/schedule table with a genuine wide multi-row merge
+            // over line-item rects), `self_populated * 2 > cols.len()`
+            // failing is NOT by itself a safe signal of sparse decoration:
+            // a real merge whose covered columns are populated in MOST but
+            // not a strict majority of the band's rows also fails the
+            // majority test, and "any content at all" is true for nearly
+            // every real merge too — using that alone regressed the real
+            // fixture (a genuine merge got read as decoration and its
+            // columns collapsed). What actually distinguishes the sparse
+            // banded body this clause exists for
+            // (`test_sparse_banded_body_keeps_every_row`: text in only ONE
+            // of the band's several rows per column) is that NO covered
+            // column ever clears even the "populated in >=2 rows" bar —
+            // `self_populated == 0`. A real merge with any column
+            // populated in 2+ rows keeps the old, safe "not decoration"
+            // (fold) answer; only a maximally sparse band — every column
+            // has content in at most one row — is rescued here.
+            self_populated == 0
+                && cols.iter().any(|&c| {
+                    rows.iter().any(|&r| {
+                        cells
+                            .get(r)
+                            .and_then(|row| row.get(c))
+                            .is_some_and(|text| !text.trim().is_empty())
+                    })
+                })
         })
         .collect()
 }

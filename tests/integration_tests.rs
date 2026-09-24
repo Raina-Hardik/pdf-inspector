@@ -11465,6 +11465,167 @@ fn test_wide_table_with_full_width_shading_keeps_every_row() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Round-4 review: two NEW regressions in `decorative_fill_rects` introduced
+// by the round-3 tall-band fix.
+//
+// Regression 1: the early return `cols_covered < 3 || cols_covered * 2 <=
+// num_cols` (:2126 as of the round-4 diff) exits BEFORE the subdivision
+// check runs, so a band that is tall enough to reach the content+subdivision
+// test but narrow in COLUMNS never gets there -- it falls straight through
+// to "not decoration" and folds. `make_shaded_table_pdf`'s `band_c0..band_c1`
+// already parametrizes column width, so these are the same wide (>10-col)
+// fixture shape as the round-3 cases above, just with a narrower band.
+//
+// Regression 2: even when a band DOES reach the content+subdivision test, a
+// sparsely-populated band (text in only one of its several banded rows per
+// column) fails the strict "self_populated * 2 > cols.len()" majority test,
+// so it read as "not decoration" and folded -- moving that one row's text
+// into a DIFFERENT row's cell, which is a correctness bug, not just row
+// collapse.
+// ---------------------------------------------------------------------------
+
+/// Same per-cell/shading-band shape as `make_shaded_table_pdf`, except the
+/// banded rows only get real text in `populated_row` (a row index in table
+/// space); every other banded row is left blank, and every row OUTSIDE the
+/// band is always populated. Reproduces a sparsely-populated banded body.
+fn make_shaded_table_pdf_sparse(
+    cols: usize,
+    rows: usize,
+    band: (usize, usize),
+    band_c0: usize,
+    band_c1: usize,
+    populated_row: usize,
+) -> Vec<u8> {
+    const COL_W: f32 = 40.0;
+    const ROW_H: f32 = 30.0;
+    const X0: f32 = 30.0;
+    const Y0: f32 = 60.0;
+
+    let row_y = |r: usize| Y0 + (rows - 1 - r) as f32 * ROW_H;
+    let (first, last) = band;
+
+    let mut content = String::from("q\n");
+    content.push_str("0.92 0.92 0.92 rg\n");
+    let y = row_y(last);
+    let h = (last - first + 1) as f32 * ROW_H;
+    content.push_str(&format!(
+        "{} {} {} {} re f\n",
+        X0 + band_c0 as f32 * COL_W,
+        y,
+        (band_c1 - band_c0) as f32 * COL_W,
+        h
+    ));
+    content.push_str("1 1 1 rg\n");
+    for r in 0..rows {
+        for c in 0..cols {
+            content.push_str(&format!(
+                "{} {} {} {} re f\n",
+                X0 + c as f32 * COL_W,
+                row_y(r),
+                COL_W,
+                ROW_H
+            ));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 8 Tf\n");
+    for r in 0..rows {
+        let in_band = r >= first && r <= last;
+        if in_band && r != populated_row {
+            continue;
+        }
+        for c in 0..cols {
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
+                X0 + c as f32 * COL_W + 3.0,
+                row_y(r) + 10.0,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+
+    let total_w = X0 * 2.0 + cols as f32 * COL_W;
+    let total_h = Y0 * 2.0 + rows as f32 * ROW_H;
+    make_text_pdf(&content, &format!("0 0 {} {}", total_w, total_h))
+}
+
+#[test]
+fn test_narrow_band_and_column_stripes_keep_every_row() {
+    // Regression 1. Each band is tall enough (rows_spanned * 2 > num_rows)
+    // to reach the content+subdivision test, but narrow in columns -- the
+    // exact shape the `cols_covered < 3 || cols_covered * 2 <= num_cols`
+    // early return used to swallow before that test ever ran.
+    let cases: [ShadedCase; 4] = [
+        ("band over 5 of 12 cols", 12, 6, &[(1, 5)], 0, 5),
+        ("band over 2 of 12 cols", 12, 6, &[(1, 5)], 0, 2),
+        ("band over 6 of 12 cols", 12, 6, &[(1, 5)], 3, 9),
+        ("single-column stripe", 12, 6, &[(1, 5)], 4, 5),
+    ];
+    for (name, cols, rows, bands, c0, c1) in cases {
+        let pdf = make_shaded_table_pdf(cols, rows, bands, c0, c1);
+        let cells = shaded_table_cells(&pdf);
+        assert_cells_intact(&cells, rows, cols, name);
+    }
+}
+
+#[test]
+fn test_sparse_banded_body_keeps_every_row() {
+    // Regression 2. The band covers most of the table's rows but only ONE
+    // of them actually carries text; the strict content-majority test fails
+    // ("self_populated * 2 > cols.len()") even though the subdivision test
+    // passes, and pre-fix code defaulted to fold -- shuffling that row's
+    // text into a DIFFERENT row entirely (e.g. R2C1 ending up filed as
+    // R1C1). This is a correctness bug, not mere row collapse, which is why
+    // `assert_cells_intact` (checking each cell's OWN coordinates) is the
+    // right assertion here, not just a non-empty-row count.
+    let cases: [(&str, usize, usize, (usize, usize), usize, usize, usize); 2] = [
+        (
+            "12x6 band rows 1-5, only row 2 populated",
+            12,
+            6,
+            (1, 5),
+            1,
+            10,
+            2,
+        ),
+        (
+            "12x10 band rows 2-8, only row 5 populated",
+            12,
+            10,
+            (2, 8),
+            1,
+            10,
+            5,
+        ),
+    ];
+    for (name, cols, rows, band, c0, c1, populated_row) in cases {
+        let pdf = make_shaded_table_pdf_sparse(cols, rows, band, c0, c1, populated_row);
+        let cells = shaded_table_cells(&pdf);
+        // The sparse band must not fold OR shuffle rows: every non-populated
+        // banded row stays blank in its OWN row, and the populated row's
+        // text stays in ITS OWN row -- never in a neighbor's.
+        assert_eq!(cells.len(), rows, "{name}: row count. Got {cells:?}");
+        let (band_first, band_last) = band;
+        for (r, row) in cells.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                let in_band = r >= band_first && r <= band_last;
+                let expected = if !in_band || r == populated_row {
+                    format!("R{r}C{c}")
+                } else {
+                    String::new()
+                };
+                assert_eq!(
+                    cell.trim(),
+                    expected,
+                    "{name}: row {r} col {c} was shuffled. Got {cells:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn test_page_geometry_mem_wide_table_gets_real_merge_occupancy() {
     // Regression test: `propagate_merged_cells` used to be skipped entirely
