@@ -2107,11 +2107,26 @@ fn rect_span_counts(
 ///
 /// `cells` must be the grid as assigned, BEFORE any fold rewrites it.
 ///
-/// The asymmetry is chosen on purpose: misreading decoration as a merge
-/// DESTROYS text, while failing to fold a genuine merge merely leaves text
-/// where it already was. That is also why clause 4 keeps the old row-count
-/// rule as an alternative rather than dropping it — it only ever classifies
-/// MORE rects as decoration, so nothing that was safe before becomes a fold.
+/// The asymmetry is NOT a free direction to lean in: misreading decoration
+/// as a merge (folding a band that should stay separate rows) shuffles or
+/// concatenates text that belonged to distinct rows, but misreading a
+/// genuine merge as decoration is not safe either — `test_snapshot_2013_app2`
+/// is the measured counterexample: reading its real page-frame-sized merge
+/// as decoration collapses a genuine 6-column register table down to 3
+/// columns, a 98-line diff regression on a real document. Both directions
+/// destroy structure; neither is free. Clause 4 keeps the old row-count rule
+/// as an alternative rather than dropping it because it is narrowly safe on
+/// its own terms — it only ever classifies MORE rects as decoration among
+/// WIDE bands not spanning most of the table's rows, a case measured to be
+/// decoration in every fixture seen — not because misclassifying toward
+/// decoration is safe in general.
+/// Row count above which an exactly-tied band (half its covered columns
+/// populated) is trusted as a genuine merge rather than decoration. See the
+/// tie-handling comment inside `decorative_fill_rects` for the measurement
+/// this is based on: no decorative band in the corpus exceeds ~8 rows, and
+/// the real tied fixture (`test_snapshot_2013_app2`) is 45-48 rows.
+const LARGE_BAND_ROW_COUNT: usize = 20;
+
 fn decorative_fill_rects(
     group_rects: &[(f32, f32, f32, f32)],
     skip_rects: &[bool],
@@ -2225,7 +2240,7 @@ fn decorative_fill_rects(
             }
             // The majority-content test failed, but the band IS
             // geometrically subdivided (`has_subdivision`). Measured
-            // against `test_snapshot_2013_app2` (a real 6-column
+            // against `test_snapshot_2013_app2` (a real 4-column
             // invoice/schedule table with a genuine wide multi-row merge
             // over line-item rects), `self_populated * 2 > cols.len()`
             // failing is NOT by itself a safe signal of sparse decoration:
@@ -2245,17 +2260,67 @@ fn decorative_fill_rects(
             // WHOLE band, bringing back the original row-shuffle bug the
             // majority test exists to prevent
             // (`test_sparse_banded_body_survives_one_stray_populated_cell`).
-            // The actual distinguishing signal is that spread-columns stay a
-            // MINORITY of the band's covered columns, not that there are
-            // none at all: a genuine merge (like `test_snapshot_2013_app2`)
-            // has its spread-columns forming most or at least half of the
-            // band, while a banded body with at most a couple of incidental
-            // populated cells never gets close. `self_populated * 2 <
-            // cols.len()` is a strict minority — this arm is only reached
-            // when the majority test above has already failed
-            // (`self_populated * 2 <= cols.len()`), so this narrows that
-            // remainder further by excluding the exact-half tie, which
-            // keeps the old, safe "not decoration" (fold) answer.
+            //
+            // Below the majority line, `self_populated * 2 == cols.len()` —
+            // an EXACT tie — is a real, distinct case, not something the
+            // minority arm below can absorb by nudging its comparison
+            // operator. It has now been hit with two column-population
+            // ratios that are numerically IDENTICAL and semantically
+            // opposite: `test_snapshot_2013_app2`'s real register table is
+            // 2-of-4 covered columns populated (a tie), and every one of
+            // round 5's confirmed regressions (an 8-covered-column band
+            // with 4 columns populated; a 2-covered-column band with 1
+            // populated) is ALSO exactly tied. No comparison against
+            // `cols.len()` — `<`, `<=`, `>=`, whatever — can put those two
+            // ties on opposite sides, because they present the same ratio.
+            // Moving the cutoff was tried across four rounds now (raw row
+            // count, half-covered-rows, `self_populated == 0`, the strict
+            // minority above) and each round's fix exposed the next
+            // boundary case on the SAME signal; a fifth threshold tweak on
+            // column-population ratio was rejected for that reason.
+            //
+            // The signal that separates them instead: absolute band
+            // height. Every decorative-band fixture measured in this file
+            // — round 3 through round 5's regressions, all of them — is at
+            // most ~8 rows tall. `test_snapshot_2013_app2`'s genuine merge
+            // is 45-48 rows, near the page-frame size, not a localized
+            // shading strip inside a larger table. That is not a coincidence
+            // of these particular fixtures: a decorative band is drawn to
+            // highlight or separate a handful of rows *within* a table,
+            // while a rect that tall relative to real-world row heights is,
+            // structurally, closer to being the table's own body than an
+            // accent drawn over it. `LARGE_BAND_ROW_COUNT` sits an order of
+            // magnitude above the tallest observed decorative band and
+            // comfortably below the real fixture's height, so it is not
+            // itself a re-tuned version of the ratio cutoff it replaces —
+            // it is measuring a different quantity (rows, not a ratio of
+            // columns) and the two classes it separates are not close on
+            // that quantity. `test_large_exact_half_populated_band_still_folds`
+            // pins the fold side of this tiebreak independently of the real
+            // corpus fixture; `test_narrow_bands_at_or_under_half_the_rows_keep_every_row`'s
+            // cases plus the new round-6 fixtures pin the decoration side.
+            //
+            // This IS a numeric threshold, and it has its own boundary: a
+            // real merge that happens to be both short (a handful of rows)
+            // AND exactly tied on column population would still be
+            // misclassified as decoration by this rule. No fixture measured
+            // so far exhibits that shape — every real multi-row merge found
+            // in the corpus is either a strict content majority (folds
+            // above) or a large band like `test_snapshot_2013_app2`. If one
+            // ever surfaces, it needs a signal beyond row count and column
+            // ratio (e.g. rect area relative to the table's own bounding
+            // box, or the reviewer's other suggested direction of content
+            // clustering vs. scatter within populated columns) — this
+            // comment is the marker for that being a known open boundary,
+            // not a claim that ties are fully solved.
+            if self_populated * 2 == cols.len() {
+                return rows.len() < LARGE_BAND_ROW_COUNT;
+            }
+            // Below the tie: spread-columns are a strict MINORITY of the
+            // band's covered columns. A genuine merge (like
+            // `test_snapshot_2013_app2`) has its spread-columns forming at
+            // least half the band (handled above); a banded body with at
+            // most a couple of incidental populated cells never gets close.
             self_populated * 2 < cols.len()
                 && cols.iter().any(|&c| {
                     rows.iter().any(|&r| {
@@ -5818,6 +5883,218 @@ mod tests {
             "narrow table with the same shading must keep all 6 rows, got \
              {non_empty_rows}. cells={:?}",
             table.cells
+        );
+    }
+
+    /// Like `make_wide_shaded_grid`, but the band covers only
+    /// `[band_c0, band_c1)` of the columns and only cells for which
+    /// `populated(r, c)` is true get a text item. Rows outside the band are
+    /// always fully populated, matching the fixture shape used throughout
+    /// this file (only the band's own interior is sparse).
+    fn make_shaded_grid_with_population(
+        num_cols: usize,
+        num_rows: usize,
+        band: (usize, usize),
+        band_c0: usize,
+        band_c1: usize,
+        populated: impl Fn(usize, usize) -> bool,
+    ) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+        const COL_W: f32 = 40.0;
+        const ROW_H: f32 = 30.0;
+        let row_y = |r: usize| (num_rows - 1 - r) as f32 * ROW_H;
+        let (first, last) = band;
+
+        let mut rects = Vec::new();
+        rects.push((
+            band_c0 as f32 * COL_W,
+            row_y(last),
+            (band_c1 - band_c0) as f32 * COL_W,
+            (last - first + 1) as f32 * ROW_H,
+        ));
+        for r in 0..num_rows {
+            for c in 0..num_cols {
+                rects.push((c as f32 * COL_W, row_y(r), COL_W, ROW_H));
+            }
+        }
+
+        let mut items = Vec::new();
+        for r in 0..num_rows {
+            for c in 0..num_cols {
+                let in_band = r >= first && r <= last && c >= band_c0 && c < band_c1;
+                if in_band && !populated(r, c) {
+                    continue;
+                }
+                items.push(make_item(
+                    &format!("R{r}C{c}"),
+                    c as f32 * COL_W + 3.0,
+                    row_y(r) + 10.0,
+                    8.0,
+                ));
+            }
+        }
+        (items, rects)
+    }
+
+    /// Asserts every cell holds exactly its own `R{r}C{c}` text, or is blank
+    /// where `populated` says the band left it blank -- never another row's
+    /// text folded or shuffled in.
+    fn assert_grid_population_intact(
+        table: &Table,
+        rows: usize,
+        cols: usize,
+        band: (usize, usize),
+        band_cols: (usize, usize),
+        populated: impl Fn(usize, usize) -> bool,
+        what: &str,
+    ) {
+        let (band_c0, band_c1) = band_cols;
+        assert_eq!(table.cells.len(), rows, "{what}: row count");
+        for (r, row) in table.cells.iter().enumerate() {
+            assert_eq!(row.len(), cols, "{what}: column count in row {r}");
+            for (c, cell) in row.iter().enumerate() {
+                let in_band = r >= band.0 && r <= band.1 && c >= band_c0 && c < band_c1;
+                let expected = if in_band && !populated(r, c) {
+                    String::new()
+                } else {
+                    format!("R{r}C{c}")
+                };
+                assert_eq!(
+                    cell.trim(),
+                    expected,
+                    "{what}: row {r} col {c} was folded or shuffled. cells={:?}",
+                    table.cells
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Round 6: `self_populated * 2 == cols.len()` -- an EXACT tie -- fell
+    // through both the majority test (`> cols.len()`) and the minority
+    // rescue (`< cols.len()`) to the function's implicit "not decoration"
+    // default, folding bands whose column-population ratio is numerically
+    // identical to `test_snapshot_2013_app2`'s real, genuine merge. The fix
+    // breaks the tie on absolute band height instead of the ratio (see the
+    // comment inside `decorative_fill_rects`). These three cases are the
+    // reviewer's confirmed round-6 regressions, reproduced directly at the
+    // grid level; the full-pipeline versions live in
+    // `tests/integration_tests.rs`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_exact_half_populated_columns_small_band_stays_decoration() {
+        // 12 cols, band over cols 1..9 (8 covered columns), 4 of them
+        // (1-4) fully populated across the 5-row band, 4 (5-8) left blank.
+        // self_populated = 4, cols.len() = 8: an exact tie. The band is
+        // only 5 rows tall, well under `LARGE_BAND_ROW_COUNT`, so it must
+        // stay decoration and every row must keep its own text.
+        let (num_cols, num_rows, band, c0, c1) =
+            (12usize, 6usize, (1usize, 5usize), 1usize, 9usize);
+        let populated = |_r: usize, c: usize| c < 5; // cols 1-4 of the band populated
+        let (items, rects) =
+            make_shaded_grid_with_population(num_cols, num_rows, band, c0, c1, populated);
+        let skip = vec![false; rects.len()];
+        let table = match try_build_grid(&items, &rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the grid to build, got {other:?}"),
+        };
+        assert_grid_population_intact(
+            &table,
+            num_rows,
+            num_cols,
+            band,
+            (c0, c1),
+            populated,
+            "exact-half populated columns, small band",
+        );
+    }
+
+    #[test]
+    fn test_exact_half_populated_via_stray_second_row_small_band_stays_decoration() {
+        // 12 cols, band over cols 1..9. Row 2 is fully populated across all
+        // 8 covered columns (ordinary banded-row content); row 4 ALSO has
+        // stray text in cols 1-4, which is what pushes those 4 columns'
+        // filled-row count to 2 and makes them count as "self populated".
+        // self_populated = 4, cols.len() = 8: the same exact tie as above,
+        // reached a different way.
+        let (num_cols, num_rows, band, c0, c1) =
+            (12usize, 6usize, (1usize, 5usize), 1usize, 9usize);
+        let populated = |r: usize, c: usize| r == 2 || (r == 4 && c < 5);
+        let (items, rects) =
+            make_shaded_grid_with_population(num_cols, num_rows, band, c0, c1, populated);
+        let skip = vec![false; rects.len()];
+        let table = match try_build_grid(&items, &rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the grid to build, got {other:?}"),
+        };
+        assert_grid_population_intact(
+            &table,
+            num_rows,
+            num_cols,
+            band,
+            (c0, c1),
+            populated,
+            "exact-half tie via row-2-plus-stray-row-4",
+        );
+    }
+
+    #[test]
+    fn test_exact_half_populated_of_two_columns_small_narrow_band_stays_decoration() {
+        // 12 cols (>10, so the narrow-band gate's `num_cols > 10` clears),
+        // band over cols 4..6 (2 covered columns, `is_narrow`), 6 rows tall
+        // (>=4, so the narrow-band gate's `rows_spanned >= 4` clears too).
+        // Column 4 is fully populated across the band, column 5 stays
+        // blank. self_populated = 1, cols.len() = 2: an exact tie.
+        let (num_cols, num_rows, band, c0, c1) =
+            (12usize, 10usize, (2usize, 7usize), 4usize, 6usize);
+        let populated = |_r: usize, c: usize| c == 4;
+        let (items, rects) =
+            make_shaded_grid_with_population(num_cols, num_rows, band, c0, c1, populated);
+        let skip = vec![false; rects.len()];
+        let table = match try_build_grid(&items, &rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the grid to build, got {other:?}"),
+        };
+        assert_grid_population_intact(
+            &table,
+            num_rows,
+            num_cols,
+            band,
+            (c0, c1),
+            populated,
+            "exact-half tie, 1-of-2 narrow columns populated",
+        );
+    }
+
+    #[test]
+    fn test_exact_half_populated_large_band_still_folds() {
+        // The other side of the tiebreak: a LARGE band (well past
+        // `LARGE_BAND_ROW_COUNT`) with an exact-half column-population tie
+        // must still be trusted as a genuine merge, the way
+        // `test_snapshot_2013_app2`'s real fixture is. 8 cols, band over
+        // cols 0..4 (4 covered columns), 22 rows tall in a 24-row table;
+        // 2 of the 4 covered columns fully populated, 2 blank.
+        let (num_cols, num_rows, band, c0, c1) =
+            (8usize, 24usize, (1usize, 22usize), 0usize, 4usize);
+        let populated = |_r: usize, c: usize| c < 2;
+        let (items, rects) =
+            make_shaded_grid_with_population(num_cols, num_rows, band, c0, c1, populated);
+        let skip = vec![false; rects.len()];
+        let table = match try_build_grid(&items, &rects, 1, &skip, false) {
+            GridResult::Ok(table) => table,
+            other => panic!("expected the grid to build, got {other:?}"),
+        };
+        // A fold merges the band's rows together in its populated columns,
+        // so those columns' per-row `R{r}C{c}` identity is lost -- unlike
+        // the decoration cases above, this must NOT be population-intact.
+        let band_col0_texts: Vec<&str> = table.cells[band.0..=band.1]
+            .iter()
+            .map(|row| row[c0].trim())
+            .collect();
+        assert!(
+            band_col0_texts.iter().any(|t| t.contains(' ')),
+            "expected the large tied band's populated column to fold multiple \
+             rows' text together, got {band_col0_texts:?}"
         );
     }
 
