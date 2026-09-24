@@ -632,15 +632,26 @@ pub(crate) fn detect_small_type_tables(items: &[TextItem]) -> Vec<Table> {
 ///
 /// Concretely: for a baseline table `B` with at least 2 rows (so it has a
 /// "typical" row gap to compare against) and a candidate table `T`, `T` is
-/// flagged if `T`'s item set is a PROPER superset of `B`'s (so `T` claims to
-/// have found everything `B` found, plus more) and `T`'s largest row-to-row
-/// gap exceeds `B`'s own largest row-to-row gap. `B`'s max gap is real
-/// ground truth for how far apart two rows of the SAME table get on this
-/// page — the 12.0 base always pushes the whole small-type page through
-/// pass 1 as a unit, so whatever page-gap-vs-row-gap distinction exists on
-/// this page, `B` already reflects it. `T` claiming to have grown `B` by
-/// reaching across a gap `B` itself never crossed is exactly the fingerprint
-/// a fused pair of independent tables leaves.
+/// flagged if `T` has AT LEAST 2 MORE ROWS than `B`, `T`'s item set is a
+/// PROPER superset of `B`'s (so `T` claims to have found everything `B`
+/// found, plus more), and `T`'s largest row-to-row gap exceeds `B`'s own
+/// largest row-to-row gap. `B`'s max gap is real ground truth for how far
+/// apart two rows of the SAME table get on this page — the 12.0 base
+/// always pushes the whole small-type page through pass 1 as a unit, so
+/// whatever page-gap-vs-row-gap distinction exists on this page, `B`
+/// already reflects it. `T` claiming to have grown `B` by reaching across a
+/// gap `B` itself never crossed is exactly the fingerprint a fused pair of
+/// independent tables leaves.
+///
+/// The "at least 2 more rows" condition exists because a single extra row
+/// (typically a header or footer row `B` itself failed to cluster in, a
+/// real and legitimate gain) is indistinguishable from a fused pair by row
+/// count alone — measured directly via
+/// `row_gap_outlier_does_not_flag_legitimate_layouts`'s 2.5x header-gap
+/// case, which recovers exactly one extra row and was a false positive
+/// before this condition was added. A genuinely fused SECOND table always
+/// contributes more than one row of its own, so requiring 2+ extra rows
+/// keeps that case flagged while clearing single-row recoveries.
 ///
 /// Comparing item SETS rather than counts requires `item_indices` to be
 /// comparable across different `base_font_size` calls for the same input
@@ -665,6 +676,22 @@ fn fuses_a_baseline_table(baseline: &[Table], candidate: &[Table]) -> bool {
         for t in candidate {
             if t.item_indices.len() <= b.item_indices.len() {
                 continue; // not a proper superset by count; cheap pre-filter
+            }
+            // Measured false positive (round-5 review of this fix): a
+            // legitimate config where the 12.0 baseline itself drops ONE
+            // extra row (e.g. a header row a page-derived candidate's
+            // adaptive grouping correctly recovers) looks identical to a
+            // fusion by the raw "bigger gap, superset item set" test alone
+            // — `row_gap_outlier_does_not_flag_legitimate_layouts`'s 2.5x
+            // header-gap case grows the baseline's 5-row table to 6 rows
+            // via one recovered header row, which is real data, not a
+            // fused second table. Require the candidate to add at least 2
+            // rows beyond the baseline table before treating a larger max
+            // gap as suspicious — a genuinely fused SECOND table always
+            // contributes its own multiple rows, while a single recovered
+            // row (header, footer, or an isolated stray line) never does.
+            if t.rows.len() < b.rows.len() + 2 {
+                continue;
             }
             let t_set: HashSet<usize> = t.item_indices.iter().copied().collect();
             if !b_set.is_subset(&t_set) {

@@ -11737,6 +11737,97 @@ fn test_page_geometry_mem_small_type_wide_row_spacing_needs_the_fix() {
     );
 }
 
+/// Two independent unruled 7pt small-type tables stacked on one page, 35pt
+/// apart, 20pt row pitch, 4 rows x 3 cols each — table A numeric, table B
+/// text — the round-4 review's B1 repro shape, built directly as raw PDF
+/// content rather than through the unit-test `TextItem` helpers so this
+/// exercises the real `page_geometry_mem` extraction path end to end, not
+/// just the table-detection function in isolation.
+fn make_two_stacked_small_type_tables_pdf() -> Vec<u8> {
+    const COL_X: [f32; 3] = [60.0, 200.0, 340.0];
+    const ROW_H: f32 = 20.0;
+    const GAP: f32 = 35.0;
+    const Y0: f32 = 700.0;
+    const WORDS: [&str; 12] = [
+        "Approved",
+        "Pending",
+        "Rejected",
+        "Closed",
+        "Draft",
+        "Active",
+        "On hold",
+        "Expired",
+        "Review",
+        "Filed",
+        "Open",
+        "Escalated",
+    ];
+
+    let mut content = String::new();
+    content.push_str("BT\n/F1 7 Tf\n");
+    // Table A: numeric, 4 rows x 3 cols.
+    for r in 0..4usize {
+        let y = Y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let value = 100 + r * 37 + c * 11;
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({value}) Tj\n"));
+        }
+    }
+    // Table B: text, 4 rows x 3 cols, GAP points below table A's last row.
+    let table_a_last_y = Y0 - 3.0 * ROW_H;
+    let table_b_y0 = table_a_last_y - GAP;
+    for r in 0..4usize {
+        let y = table_b_y0 - r as f32 * ROW_H;
+        for (c, &x) in COL_X.iter().enumerate() {
+            let word = WORDS[(r * 3 + c) % WORDS.len()];
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({word}) Tj\n"));
+        }
+    }
+    content.push_str("ET");
+    make_pdf_with_image_xobject_and_annots(&content, "0 0 612 792", None)
+}
+
+/// End-to-end guard for round-4 review case B1/B3, through the whole
+/// `page_geometry_mem` path (not just `detect_small_type_tables` in
+/// isolation): two independent small-type tables 35pt apart must come back
+/// as two separate 4x3 tables, never fused into one 8x3 table.
+///
+/// This fails without this round's fix: at `5449e57` (before the B1
+/// reorder + B3 `fuses_a_baseline_table` structural check), the
+/// pass-2-only candidate's adaptive row-gap grouping window (median gap x
+/// 3) swallows the 35pt cross-table gap and returns one fused 8x3 table
+/// instead.
+#[test]
+fn test_page_geometry_mem_two_stacked_small_type_tables_stay_separate() {
+    let pages = page_geometry_mem(&make_two_stacked_small_type_tables_pdf())
+        .expect("extraction should succeed");
+    let tables = &pages[0].tables;
+    assert_eq!(
+        tables.len(),
+        2,
+        "two independent small-type tables 35pt apart must come back as \
+         two tables, not fused into one, got {tables:?}"
+    );
+    for t in tables {
+        assert_eq!(
+            t.rows.len(),
+            4,
+            "each table must keep its own 4 rows, not gain the other \
+             table's rows, got {tables:?}"
+        );
+        let non_empty_cells: usize = t
+            .cells
+            .iter()
+            .flatten()
+            .filter(|c| !c.trim().is_empty())
+            .count();
+        assert_eq!(
+            non_empty_cells, 12,
+            "each 4x3 table must keep all 12 of its own cells, got {tables:?}"
+        );
+    }
+}
+
 #[test]
 fn test_page_geometry_mem_finds_a_small_type_table() {
     // End-to-end guard for the small-type case. `calculate_font_stats_from_items`
