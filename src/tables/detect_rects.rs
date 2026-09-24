@@ -2038,20 +2038,28 @@ fn rect_span_counts(
 /// behind groups of rows. Those are not merges, and folding them as merges
 /// destroys text.
 ///
-/// The predicate is deliberately INDEPENDENT OF COLUMN COUNT. What
-/// distinguishes decoration from a merge is how many COLUMNS a multi-row
-/// rect covers at once: a genuine merged cell is a cell (one column,
-/// occasionally two), whereas a shading band is table furniture spanning the
-/// table's whole width, i.e. the merge source in a strict majority of
-/// columns, which no real merged cell is.
+/// The predicate is NOT independent of column count in the way the phrase
+/// once suggested: a wide band (a strict majority of columns) is decoration
+/// unconditionally when it spans at most half the rows, but a NARROW band
+/// (fewer than three columns, or at most half the columns) can also be
+/// decoration — it just has to clear the content+subdivision test described
+/// below instead of the row-count shortcut, and only when it is tall enough
+/// (`rows_spanned >= 4`) in a wide-enough table (`num_cols > 10`). What
+/// column count changes is which EVIDENCE is trusted, not whether narrow
+/// bands are evaluated at all.
 ///
-/// A rect is decoration when all four hold:
-///   1. it spans more than one grid row (otherwise it drives no fold);
-///   2. it covers at least three columns — a floor that keeps a legitimate
-///      2x2 merge in a small grid out of the net;
-///   3. it covers a strict majority of all columns; and
-///   4. EITHER it spans at most half the grid's rows, OR it passes the
-///      content-and-subdivision test described below.
+/// A rect is decoration when:
+///   1. it spans more than one grid row (otherwise it drives no fold); and
+///   2. EITHER
+///      - it covers a strict majority of all columns (with a floor of at
+///        least three, keeping a legitimate 2x2 merge in a small grid out of
+///        the net) AND spans at most half the grid's rows — the old,
+///        unconditional row-count rule; OR
+///      - it passes the content-and-subdivision test described below,
+///        which every band — wide or narrow — is evaluated against once the
+///        row-count rule alone does not resolve it (subject to the extra
+///        `rows_spanned >= 4` / `num_cols > 10` gate for narrow bands,
+///        below).
 ///
 /// Clause 4 used to be the row-count half alone, and that was wrong in
 /// principle. Row count is a bad proxy for decoration: a shading pattern
@@ -2127,24 +2135,27 @@ fn decorative_fill_rects(
                 return false;
             }
             let tall_band = rows_spanned * 2 > num_rows;
-            // The column-width gate below (`cols_covered < 3 ||
-            // cols_covered * 2 <= num_cols`) exists to keep the OLD,
-            // unconditional row-count rule (below) conservative: a band
-            // that covers few columns is cheap to mistake for a narrow
-            // multi-row merge, so that legacy rule only ever fires on
-            // wide bands. It must NOT gate the newer content+subdivision
-            // test for tall bands (>half the table's rows), because that
-            // test has its own independent geometric evidence
-            // (`contains_stacked_subrects`) that a narrow band or a
-            // single-column stripe can supply just as well as a wide one
-            // — gating it here was why narrow bands and column stripes
-            // fell straight through to "fold" without ever being
-            // evaluated (regression: rows folding in wide tables for
-            // 5/12, 2/12, 6/12-column bands and single-column stripes).
-            if !tall_band {
-                if cols_covered < 3 || cols_covered * 2 <= num_cols {
-                    return false;
-                }
+            let is_narrow = cols_covered < 3 || cols_covered * 2 <= num_cols;
+            // The column-width gate (`is_narrow`) exists to keep the OLD,
+            // unconditional row-count rule below conservative: a band that
+            // covers few columns is cheap to mistake for a narrow multi-row
+            // merge, so that legacy rule only ever fires on wide bands. It
+            // must NOT gate the newer content+subdivision test at all —
+            // whether or not the band is "tall" (>half the table's rows) is
+            // irrelevant to whether a narrow band gets EVALUATED by that
+            // test, because the test has its own independent geometric
+            // evidence (`contains_stacked_subrects`) that a narrow band or a
+            // single-column stripe can supply just as well as a wide one.
+            // Gating narrow bands on `tall_band` was why narrow bands and
+            // column stripes that covered AT MOST half the table's rows fell
+            // straight through to "fold" without ever being evaluated
+            // (regression: 5-row bands in 12-row tables, single-column
+            // stripes over less than half the rows, etc. — the earlier fix
+            // only reached bands covering MORE than half the rows).
+            if !is_narrow && !tall_band {
+                // Wide band, not spanning most of the table's rows: the old,
+                // unconditional row-count rule (clause 4's "at most half the
+                // rows" alternative) applies directly — always decoration.
                 return true;
             }
             // A narrow band is geometrically indistinguishable from a
@@ -2176,9 +2187,7 @@ fn decorative_fill_rects(
             //     width the legacy, safer "not decoration" answer is kept.
             // A narrow-but-short OR narrow-but-narrow-table band never
             // reaches the content+subdivision test at all.
-            if (cols_covered < 3 || cols_covered * 2 <= num_cols)
-                && (rows_spanned < 4 || num_cols <= 10)
-            {
+            if is_narrow && (rows_spanned < 4 || num_cols <= 10) {
                 return false;
             }
             let rows: Vec<usize> = (0..num_rows)
@@ -2225,16 +2234,29 @@ fn decorative_fill_rects(
             // majority test, and "any content at all" is true for nearly
             // every real merge too — using that alone regressed the real
             // fixture (a genuine merge got read as decoration and its
-            // columns collapsed). What actually distinguishes the sparse
-            // banded body this clause exists for
-            // (`test_sparse_banded_body_keeps_every_row`: text in only ONE
-            // of the band's several rows per column) is that NO covered
-            // column ever clears even the "populated in >=2 rows" bar —
-            // `self_populated == 0`. A real merge with any column
-            // populated in 2+ rows keeps the old, safe "not decoration"
-            // (fold) answer; only a maximally sparse band — every column
-            // has content in at most one row — is rescued here.
-            self_populated == 0
+            // columns collapsed).
+            //
+            // Requiring `self_populated == 0` (literally zero columns
+            // showing the "spread across >=2 rows" pattern) was itself too
+            // strict: one stray populated cell anywhere in the band — even
+            // in a column and row otherwise unrelated to the band's real
+            // content — can push a single column's count to 2, taking
+            // `self_populated` from 0 to 1 and disabling the rescue for the
+            // WHOLE band, bringing back the original row-shuffle bug the
+            // majority test exists to prevent
+            // (`test_sparse_banded_body_survives_one_stray_populated_cell`).
+            // The actual distinguishing signal is that spread-columns stay a
+            // MINORITY of the band's covered columns, not that there are
+            // none at all: a genuine merge (like `test_snapshot_2013_app2`)
+            // has its spread-columns forming most or at least half of the
+            // band, while a banded body with at most a couple of incidental
+            // populated cells never gets close. `self_populated * 2 <
+            // cols.len()` is a strict minority — this arm is only reached
+            // when the majority test above has already failed
+            // (`self_populated * 2 <= cols.len()`), so this narrows that
+            // remainder further by excluding the exact-half tie, which
+            // keeps the old, safe "not decoration" (fold) answer.
+            self_populated * 2 < cols.len()
                 && cols.iter().any(|&c| {
                     rows.iter().any(|&r| {
                         cells

@@ -11580,7 +11580,17 @@ fn test_sparse_banded_body_keeps_every_row() {
     // R1C1). This is a correctness bug, not mere row collapse, which is why
     // `assert_cells_intact` (checking each cell's OWN coordinates) is the
     // right assertion here, not just a non-empty-row count.
-    let cases: [(&str, usize, usize, (usize, usize), usize, usize, usize); 2] = [
+    /// (name, cols, rows, band, band_c0, band_c1, populated_row)
+    type SparseShadedCase = (
+        &'static str,
+        usize,
+        usize,
+        (usize, usize),
+        usize,
+        usize,
+        usize,
+    );
+    let cases: [SparseShadedCase; 2] = [
         (
             "12x6 band rows 1-5, only row 2 populated",
             12,
@@ -11624,6 +11634,246 @@ fn test_sparse_banded_body_keeps_every_row() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round-5 review: the round-4 fixes were themselves narrower than the actual
+// bug class.
+//
+// Issue 1: a narrow band that does NOT cover more than half the table's rows
+// (`!tall_band`) still fell straight through the old `if !tall_band { ...
+// return false for narrow }` branch to "not decoration" without ever
+// reaching the content+subdivision test — the round-4 fix only reached
+// bands covering MORE than half the rows.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_narrow_bands_at_or_under_half_the_rows_keep_every_row() {
+    // All five are confirmed round-5 regressions: narrow/single-column bands
+    // that cover AT MOST half the table's rows, so `tall_band` is false and
+    // the old code's `!tall_band` branch returned "not decoration" for a
+    // narrow band without ever running the content+subdivision test.
+    let cases: [ShadedCase; 5] = [
+        (
+            "12x12, 5-row band (of 12) cols 0-5",
+            12,
+            12,
+            &[(2, 6)],
+            0,
+            5,
+        ),
+        (
+            "12x10, 5-row band (of 10) cols 3-8",
+            12,
+            10,
+            &[(2, 6)],
+            3,
+            8,
+        ),
+        (
+            "12x12, 6-row band, single-column stripe",
+            12,
+            12,
+            &[(0, 5)],
+            4,
+            5,
+        ),
+        (
+            "12x20, 8-row band (of 20) cols 1-6",
+            12,
+            20,
+            &[(3, 10)],
+            1,
+            6,
+        ),
+        ("14x16, 8-row band, 2 narrow cols", 14, 16, &[(4, 11)], 2, 4),
+    ];
+    for (name, cols, rows, bands, c0, c1) in cases {
+        let pdf = make_shaded_table_pdf(cols, rows, bands, c0, c1);
+        let cells = shaded_table_cells(&pdf);
+        assert_cells_intact(&cells, rows, cols, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue 2: the sparse-content rescue required `self_populated == 0` — a
+// single stray populated cell anywhere in the band (even unrelated to the
+// band's real content) disabled the rescue for the WHOLE band, bringing
+// back the original row-shuffle bug. The fix judges columns individually:
+// rescue whenever the spread-columns (>=2 populated rows) are a MINORITY of
+// the band's covered columns, not only when there are literally none.
+// ---------------------------------------------------------------------------
+
+/// Like `make_shaded_table_pdf_sparse`, but takes a full per-cell
+/// `populated` predicate instead of a single `populated_row`, so a test can
+/// mix "sparse except one stray cell" or "some columns fully populated,
+/// others blank" shapes within one band.
+fn make_shaded_table_pdf_with_population(
+    cols: usize,
+    rows: usize,
+    band: (usize, usize),
+    band_c0: usize,
+    band_c1: usize,
+    populated: impl Fn(usize, usize) -> bool,
+) -> Vec<u8> {
+    const COL_W: f32 = 40.0;
+    const ROW_H: f32 = 30.0;
+    const X0: f32 = 30.0;
+    const Y0: f32 = 60.0;
+
+    let row_y = |r: usize| Y0 + (rows - 1 - r) as f32 * ROW_H;
+    let (first, last) = band;
+
+    let mut content = String::from("q\n");
+    content.push_str("0.92 0.92 0.92 rg\n");
+    let y = row_y(last);
+    let h = (last - first + 1) as f32 * ROW_H;
+    content.push_str(&format!(
+        "{} {} {} {} re f\n",
+        X0 + band_c0 as f32 * COL_W,
+        y,
+        (band_c1 - band_c0) as f32 * COL_W,
+        h
+    ));
+    content.push_str("1 1 1 rg\n");
+    for r in 0..rows {
+        for c in 0..cols {
+            content.push_str(&format!(
+                "{} {} {} {} re f\n",
+                X0 + c as f32 * COL_W,
+                row_y(r),
+                COL_W,
+                ROW_H
+            ));
+        }
+    }
+    content.push_str("Q\nBT\n/F1 8 Tf\n");
+    for r in 0..rows {
+        for c in 0..cols {
+            if !populated(r, c) {
+                continue;
+            }
+            content.push_str(&format!(
+                "1 0 0 1 {} {} Tm (R{}C{}) Tj\n",
+                X0 + c as f32 * COL_W + 3.0,
+                row_y(r) + 10.0,
+                r,
+                c
+            ));
+        }
+    }
+    content.push_str("ET");
+
+    let total_w = X0 * 2.0 + cols as f32 * COL_W;
+    let total_h = Y0 * 2.0 + rows as f32 * ROW_H;
+    make_text_pdf(&content, &format!("0 0 {} {}", total_w, total_h))
+}
+
+/// Asserts every cell either holds its own `R{r}C{c}` text or, if it was
+/// never populated by the fixture's `populated` predicate, is blank — never
+/// another row's text (the row-shuffle failure mode).
+fn assert_population_intact(
+    cells: &[Vec<String>],
+    rows: usize,
+    cols: usize,
+    populated: impl Fn(usize, usize) -> bool,
+    what: &str,
+) {
+    assert_eq!(cells.len(), rows, "{what}: row count. Got {cells:?}");
+    for (r, row) in cells.iter().enumerate() {
+        assert_eq!(row.len(), cols, "{what}: column count in row {r}");
+        for (c, cell) in row.iter().enumerate() {
+            let expected = if populated(r, c) {
+                format!("R{r}C{c}")
+            } else {
+                String::new()
+            };
+            assert_eq!(
+                cell.trim(),
+                expected,
+                "{what}: row {r} col {c} was folded or shuffled. Got {cells:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_sparse_banded_body_survives_one_stray_populated_cell() {
+    // Confirmed round-5 regression 1: 12x6, band rows 1-5, cols 1-9 mostly
+    // blank except row 2 (fully populated across the band's columns) plus
+    // one extra stray cell at [4,3]. `self_populated` for column 3 becomes 1
+    // (rows 2 and 4), which alone used to disable the whole-band rescue.
+    let (cols, rows, band, c0, c1) = (12usize, 6usize, (1usize, 5usize), 1usize, 10usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        r == 2 || (r == 4 && c == 3)
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "stray cell at [4,3], cols 1-9",
+    );
+}
+
+#[test]
+fn test_sparse_banded_body_survives_one_stray_populated_cell_narrow_cols() {
+    // Confirmed round-5 regression 2: same shape, narrower band columns 0-4.
+    let (cols, rows, band, c0, c1) = (12usize, 6usize, (1usize, 5usize), 0usize, 5usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        r == 2 || (r == 4 && c == 3)
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "stray cell at [4,3], cols 0-4",
+    );
+}
+
+#[test]
+fn test_sparse_banded_body_survives_partially_populated_columns() {
+    // Confirmed round-5 regression 3: 12x6, band rows 1-5, cols 1-9 fully
+    // populated across all band rows EXCEPT columns 1-5, which stay blank
+    // inside the band. Columns 6-9 used to fold (their real, distinct
+    // per-row text collapsed into one cell) even though only part of the
+    // band was sparse.
+    let (cols, rows, band, c0, c1) = (12usize, 6usize, (1usize, 5usize), 1usize, 10usize);
+    let populated = |r: usize, c: usize| -> bool {
+        if r < band.0 || r > band.1 {
+            return true;
+        }
+        if !(c0..c1).contains(&c) {
+            return true;
+        }
+        c >= 6
+    };
+    let pdf = make_shaded_table_pdf_with_population(cols, rows, band, c0, c1, populated);
+    let cells = shaded_table_cells(&pdf);
+    assert_population_intact(
+        &cells,
+        rows,
+        cols,
+        populated,
+        "cols 6-9 fully populated in band, cols 1-5 blank",
+    );
 }
 
 #[test]
