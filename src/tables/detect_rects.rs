@@ -6152,11 +6152,14 @@ mod tests {
 
     // --- cell occupancy: merge evidence vs. decoration ---------------------
 
+    /// One rect's bounds: `(x, y, width, height)`.
+    type Rect = (f32, f32, f32, f32);
+
     /// A 4-column x 3-row grid of per-cell rects, one distinct text item per
     /// cell. `shaded_rows` additionally get a full-width decorative band
     /// painted behind the whole row — the shape a reviewer reproduced as a
     /// cell-occupancy false positive.
-    fn shaded_grid(shaded_rows: &[usize]) -> (Vec<TextItem>, Vec<(f32, f32, f32, f32)>) {
+    fn shaded_grid(shaded_rows: &[usize]) -> (Vec<TextItem>, Vec<Rect>) {
         const COLS: usize = 4;
         const ROWS: usize = 3;
         const COL_W: f32 = 50.0;

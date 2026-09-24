@@ -11912,7 +11912,7 @@ fn test_page_geometry_mem_small_type_table_with_prose_on_same_page() {
         "quarterly",
         "recognition",
         "allocation",
-        "segments",
+        "segment",
         "commentary",
         "period-over-period",
         "paragraph",

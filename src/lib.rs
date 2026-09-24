@@ -658,9 +658,26 @@ pub struct PageGeometry {
 /// cannot be trusted, whichever formula produces it).
 ///
 /// This returns a short, deterministically-ordered list of bases for
-/// `detect_small_type_tables` to try, not a single answer:
+/// `detect_small_type_tables` to try, not a single answer. **The old fixed
+/// 12.0 is listed FIRST** and `detect_small_type_tables` only replaces it on
+/// a STRICT item-count improvement (never on a tie) — two independent
+/// small-type tables separated by a gap can make several candidates recover
+/// the identical total item count while only one of them (the page-derived
+/// ones, via their adaptive row-gap grouping) actually fuses the two tables
+/// into one wrong table. Trying 12.0 first and requiring later candidates to
+/// strictly beat it, not merely match it, means a tie always keeps the
+/// structurally-correct fixed-12.0 result instead of preferring whichever
+/// fused candidate happened to be listed first.
 ///
-/// 1. **A pass-2-only base**, when the page's size spread allows one. Pass 1
+/// 1. **The old fixed 12.0, listed FIRST.** `12.0 * 0.90 = 10.8` sits above
+///    any all-small-type page's max size by construction (this function is
+///    only ever called for a page where nothing reaches 9pt), so 12.0 always
+///    puts the WHOLE page through pass 1 together — the same guarantee the
+///    original fixed fallback gave, and never worse than what it already
+///    achieved. It goes first specifically so that `detect_small_type_tables`'s
+///    strict-improvement rule keeps it, rather than a later candidate, on
+///    any tie.
+/// 2. **A pass-2-only base**, when the page's size spread allows one. Pass 1
 ///    (small-font, `detect_heuristic.rs`) admits `size <= base * 0.90` and
 ///    runs FIRST, claiming whatever it finds before pass 2 (body-font,
 ///    `base * 0.85 <= size <= base * 1.05`) ever sees it — so "both sizes
@@ -673,12 +690,6 @@ pub struct PageGeometry {
 ///    1.167`. Outside that ratio there is no base that keeps a mixed-size
 ///    table together in pass 2 alone, and this candidate is omitted rather
 ///    than returned anyway and silently losing data.
-/// 2. **The old fixed 12.0.** `12.0 * 0.90 = 10.8` sits above any
-///    all-small-type page's max size by construction (this function is
-///    only ever called for a page where nothing reaches 9pt), so 12.0 always
-///    puts the WHOLE page through pass 1 together — the same guarantee the
-///    original fixed fallback gave, and never worse than what it already
-///    achieved.
 /// 3. **A page-derived pass-1-only base** (`max_size / 0.90`, adjusted for
 ///    `f32` rounding), the same "whole page through pass 1" guarantee as
 ///    12.0 but derived from the page's own text rather than a constant —
@@ -705,6 +716,14 @@ pub(crate) fn small_type_candidate_bases(items: &[TextItem]) -> Vec<f32> {
 
     let mut candidates = Vec::new();
 
+    // 12.0 goes FIRST: `detect_small_type_tables` only replaces the
+    // incumbent on a strict improvement, never a tie, so listing the
+    // structurally-safe fixed fallback first means a tie in recovered item
+    // count keeps 12.0's result instead of preferring whichever page-derived
+    // candidate happens to come later and may have fused two separate
+    // small-type tables into one via its adaptive row-gap grouping.
+    candidates.push(12.0);
+
     let pass2_base = max_size / 1.049;
     // Strict margin (`* 1.001`) so a size sitting exactly on pass 1's own
     // boundary is never treated as "safely outside" it by a hair of `f32`
@@ -713,7 +732,6 @@ pub(crate) fn small_type_candidate_bases(items: &[TextItem]) -> Vec<f32> {
         candidates.push(pass2_base);
     }
 
-    candidates.push(12.0);
     candidates.push(max_size / 0.899);
 
     candidates
