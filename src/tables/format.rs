@@ -925,6 +925,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Name|"));
@@ -941,6 +942,7 @@ mod tests {
             cells: vec![vec!["Only".into(), "Row".into()]],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("|Only|"));
@@ -958,6 +960,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         assert!(is_complete_data_table(&complete));
 
@@ -978,6 +981,7 @@ mod tests {
             cells: vec![],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         assert_eq!(table_to_markdown(&table), "");
     }
@@ -994,6 +998,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("(1) Footnote text"));
@@ -1010,6 +1015,7 @@ mod tests {
             ],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         let md = table_to_markdown(&table);
         assert!(md.contains("名前"));
@@ -1024,6 +1030,7 @@ mod tests {
             cells: vec![vec![]],
             item_indices: vec![],
             kind: TableKind::Data,
+            ..Default::default()
         };
         assert_eq!(table_to_markdown(&table), "");
     }

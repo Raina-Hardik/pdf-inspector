@@ -881,6 +881,48 @@ mod tests {
         assert_eq!(correct_base_size(&lines, 10.0), 10.0);
     }
 
+    #[test]
+    fn item_font_stats_break_ties_toward_the_smaller_size() {
+        // `page_geometry_mem` now derives its base font size from this
+        // helper. The property it needs is that an exact tie has ONE answer:
+        // the ad-hoc count it replaced resolved ties by `HashMap` iteration
+        // order, so identical bytes could yield different heuristic tables
+        // between runs. Equal counts at 10pt and 14pt, built in both orders.
+        let ascending: Vec<crate::types::TextItem> = [10.0f32, 14.0]
+            .iter()
+            .flat_map(|&s| {
+                (0..5).map(move |_| line_of("body text", s, false, 700.0).items[0].clone())
+            })
+            .collect();
+        let mut descending = ascending.clone();
+        descending.reverse();
+
+        assert_eq!(
+            calculate_font_stats_from_items(&ascending).most_common_size,
+            10.0
+        );
+        assert_eq!(
+            calculate_font_stats_from_items(&descending).most_common_size,
+            10.0
+        );
+    }
+
+    #[test]
+    fn item_font_stats_ignore_zero_size_marker_items() {
+        // Image placeholders and link annotations carry `font_size: 0.0`.
+        // They must not vote, whatever their number.
+        let mut items: Vec<crate::types::TextItem> = (0..3)
+            .map(|_| line_of("body text", 11.0, false, 700.0).items[0].clone())
+            .collect();
+        for _ in 0..40 {
+            items.push(line_of("[Image: Im0]", 0.0, false, 700.0).items[0].clone());
+        }
+        assert_eq!(
+            calculate_font_stats_from_items(&items).most_common_size,
+            11.0
+        );
+    }
+
     fn line_of(text: &str, font_size: f32, bold: bool, y: f32) -> crate::types::TextLine {
         let item = crate::types::TextItem {
             text: text.into(),

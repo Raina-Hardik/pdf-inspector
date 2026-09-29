@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::tables::Table;
+use crate::tables::{Table, TableSource, MAX_TABLE_COLUMNS};
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 use super::cell_text::{cell_fragment, join_cell_items, push_cell_item};
@@ -16,6 +16,26 @@ const RULE_Y_TOLERANCE: f32 = 2.0;
 const RULE_JOIN_GAP: f32 = 6.0;
 const RULE_SPAN_TOLERANCE: f32 = 8.0;
 const TEXT_ROW_TOLERANCE: f32 = 2.5;
+// NOT derived from `MAX_TABLE_COLUMNS`, deliberately.
+//
+// The original phrasing of this constant ("tables support at most 25
+// columns, so 27+ verticals must be a chart") tied it to the table cap, and
+// raising the cap to 40 mechanically raised this to 42. That is a real,
+// unvalidated behaviour change: every chart with 27-41 long verticals stops
+// being excluded and becomes eligible to be misread as a table. It also
+// broke eight existing chart tests, which the first attempt at this work
+// papered over by rewriting their fixtures to 44 columns.
+//
+// So this stays at 27 and is documented as what it actually is: a density
+// heuristic about vector CHART geometry, not a restatement of the table
+// column cap. The two are allowed to disagree.
+//
+// RESIDUAL LIMITATION, stated rather than hidden: a ruled-LINE table with
+// 27+ columns is still excluded here as chart geometry. The wide-table case
+// this work targets (register/bitfield tables) is backed by filled `re`
+// rects and goes through `detect_rects.rs`, which is unaffected. Lifting
+// this needs a positive chart-vs-table discriminator and a regression-suite
+// run, not a threshold nudge.
 const DENSE_CHART_MIN_VERTICAL_EDGES: usize = 27;
 const DENSE_CHART_LABEL_PAD: f32 = 20.0;
 const DENSE_CHART_MAX_SHARED_PANEL_GRIDS: usize = 4;
@@ -333,11 +353,12 @@ fn build_stacked_token_table(rows: &[AnchoredRow<'_>], rules: &[HorizontalRule])
         .map(|rule| rule.2)
         .fold(f32::NEG_INFINITY, f32::max);
     let split = x_min + (x_max - x_min) * 0.35;
-    Some(Table::new(
+    Some(Table::with_source(
         vec![x_min, split, x_max],
         vec![rows[0].0],
         vec![vec![header, value]],
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -366,7 +387,7 @@ fn build_text_anchor_table(
     if anchors.len() == 1 {
         return build_stacked_token_table(&rows, rules);
     }
-    if !(2..=25).contains(&anchors.len()) || anchors.last()? - anchors[0] < 30.0 {
+    if !(2..=MAX_TABLE_COLUMNS).contains(&anchors.len()) || anchors.last()? - anchors[0] < 30.0 {
         return None;
     }
     let numeric_header_cells = rows[0]
@@ -559,11 +580,12 @@ fn build_text_anchor_table(
         return None;
     }
 
-    Some(Table::new(
+    Some(Table::with_source(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -852,7 +874,9 @@ fn build_dense_row_anchor_table(
         .iter()
         .map(|(_, row)| logical_row_anchors(row))
         .max_by_key(Vec::len)?;
-    if !(4..=25).contains(&anchors.len()) || anchors.last()? - anchors[0] < table_width * 0.6 {
+    if !(4..=MAX_TABLE_COLUMNS).contains(&anchors.len())
+        || anchors.last()? - anchors[0] < table_width * 0.6
+    {
         return None;
     }
 
@@ -908,11 +932,12 @@ fn build_dense_row_anchor_table(
         return None;
     }
 
-    Some(Table::new(
+    Some(Table::with_source(
         columns,
         rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -1040,7 +1065,13 @@ fn build_open_edge_grid_table_for_rules(
     let mut rows = Vec::with_capacity(row_edges.len());
     rows.push(header_y);
     rows.extend_from_slice(&row_edges[..row_edges.len() - 1]);
-    Some(Table::new(col_edges, rows, cells, item_indices))
+    Some(Table::with_source(
+        col_edges,
+        rows,
+        cells,
+        item_indices,
+        TableSource::Lines,
+    ))
 }
 
 fn build_open_edge_grid_tables(
@@ -1428,11 +1459,12 @@ fn refine_segment_grid_text_rows(
         cells.len(),
         dense_rows
     );
-    Some(Table::new(
+    Some(Table::with_source(
         table.columns.clone(),
         anchored_rows.iter().map(|(y, _)| *y).collect(),
         cells,
         item_indices,
+        TableSource::Lines,
     ))
 }
 
@@ -1446,7 +1478,7 @@ pub fn detect_tables_from_lines(items: &[TextItem], lines: &[PdfLine], page: u32
 
 /// Bounding boxes of chart panels backed by a very dense vector grid.
 ///
-/// Tables support at most 25 columns, so a panel with at least 27 distinct,
+/// A panel with at least `DENSE_CHART_MIN_VERTICAL_EDGES` distinct,
 /// long vertical coordinates plus repeated horizontal rules is treated as
 /// chart geometry. When the grid is enclosed by a painted panel rectangle,
 /// the region expands to that rectangle so axis labels, legends, and source
@@ -2101,11 +2133,12 @@ fn detect_tables_from_lines_inner(
         page, num_rows, num_cols, item_indices.len(), page_item_count, non_empty_rows, cols_with_content
     );
 
-    let legacy_table = Table::new(
+    let legacy_table = Table::with_source(
         col_edges,
         row_edges_desc[..num_rows].to_vec(),
         cells,
         item_indices,
+        TableSource::Lines,
     );
     let legacy_tables = if overlaps_multiple_tables(&legacy_table, &independent_segment_tables) {
         log::debug!(
@@ -2172,6 +2205,44 @@ mod tests {
             x2: x,
             y2,
             page,
+        }
+    }
+
+    /// Synthetic chart-threshold boundary sweep.
+    ///
+    /// VALIDATION HONESTY: the sibling `pdf-evals` regression suite that
+    /// `CLAUDE.md` names as the gate for detector-threshold changes was not
+    /// reachable from this environment, so this is a synthetic proxy, not a
+    /// `bench.py test` / `bench.py score` run. It is stated as such rather
+    /// than left implicit.
+    ///
+    /// It pins `DENSE_CHART_MIN_VERTICAL_EDGES` exactly where it is: a
+    /// panel with 26 long verticals is NOT chart geometry and 27+ is, at
+    /// every count through the range (27/30/35/40/41) that a raise to 42
+    /// would have silently reclassified.
+    #[test]
+    fn dense_chart_threshold_boundary_is_unchanged_by_the_column_cap_raise() {
+        let regions_for = |count: usize| {
+            let mut lines: Vec<PdfLine> = (0..count)
+                .map(|column| make_vline(100.0 + column as f32 * 8.0, 400.0, 550.0, 1))
+                .collect();
+            let span = 100.0 + (count.saturating_sub(1)) as f32 * 8.0 + 12.0;
+            lines.extend((0..6).map(|row| make_hline(400.0 + row as f32 * 30.0, 100.0, span, 1)));
+            detect_dense_line_chart_regions(&lines, &[], 1)
+        };
+
+        assert!(
+            regions_for(DENSE_CHART_MIN_VERTICAL_EDGES - 1).is_empty(),
+            "{} verticals must stay below the chart threshold",
+            DENSE_CHART_MIN_VERTICAL_EDGES - 1
+        );
+        for count in [27usize, 30, 35, 40, 41, 42] {
+            assert!(
+                !regions_for(count).is_empty(),
+                "a {count}-vertical dense grid must still be excluded as chart \
+                 geometry; raising DENSE_CHART_MIN_VERTICAL_EDGES to 42 would \
+                 have reclassified 27..=41 as table-eligible with no evidence"
+            );
         }
     }
 
